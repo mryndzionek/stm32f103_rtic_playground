@@ -342,7 +342,6 @@ mod app {
         let am_crl = gpioa.crl;
 
         display::spawn_after(50.millis(), DispEvent::INIT).unwrap();
-        am_sensor::spawn_after(1.secs()).unwrap();
 
         (
             Shared {
@@ -373,9 +372,8 @@ mod app {
         )
     }
 
-    #[task(binds = USART2, shared = [], local = [led, rx, prod], priority = 16)]
+    #[task(binds = USART2, shared = [], local = [rx, prod], priority = 16)]
     fn usart2(cx: usart2::Context) {
-        cx.local.led.set_low();
         let rx = cx.local.rx;
         let prod = cx.local.prod;
         if rx.is_rx_not_empty() {
@@ -393,7 +391,6 @@ mod app {
         } else if rx.is_idle() {
             rx.unlisten_idle();
         }
-        cx.local.led.set_high();
     }
 
     fn dst_adjust(dt: PrimitiveDateTime) -> Duration {
@@ -510,7 +507,7 @@ mod app {
     }
 
     #[task(binds = EXTI1, shared = [datetime, gps_locked, is_sunrise, pps_timeout, eeprom],
-                           local = [pps, dst], priority = 16)]
+                           local = [pps, dst, am_tm: u8 = 2], priority = 16)]
     fn pps_isr(cx: pps_isr::Context) {
         let pps_isr::SharedResources {
             datetime,
@@ -558,6 +555,12 @@ mod app {
         );
         if let Some(dt) = dt {
             display::spawn(DispEvent::UPDATE { dt: dt, gps: gps }).unwrap();
+        }
+        if *cx.local.am_tm == 0 {
+            am_sensor::spawn_after(600.millis()).unwrap();
+            *cx.local.am_tm = 10;
+        } else {
+            *cx.local.am_tm -= 1;
         }
     }
 
@@ -845,13 +848,14 @@ mod app {
         } else {
             defmt::panic!();
         }
-        am_sensor::spawn_after(2.secs()).unwrap();
     }
 
-    #[idle(local = [])]
-    fn idle(_cx: idle::Context) -> ! {
+    #[idle(local = [led])]
+    fn idle(cx: idle::Context) -> ! {
         loop {
+            cx.local.led.set_high();
             rtic::export::wfi();
+            cx.local.led.set_low();
         }
     }
 }
