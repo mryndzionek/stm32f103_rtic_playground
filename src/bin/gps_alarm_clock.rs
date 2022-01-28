@@ -2,11 +2,14 @@
 #![no_main]
 #![no_std]
 
-#[rtic::app(device = stm32f1xx_hal::pac, peripherals = true, dispatchers = [PVD, WWDG])]
+#[rtic::app(device = stm32f1xx_hal::pac, peripherals = true, dispatchers = [PVD, WWDG, RTC, SPI1])]
 mod app {
     use bbqueue::BBBuffer;
+    use bitflags::bitflags;
     use bresenham::Bresenham;
     use core::fmt::{Debug, Write};
+    use core::iter::Peekable;
+    use core::slice::Iter;
     use defmt::{write, Format, Formatter};
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
     use eeprom::{EEPROMExt, Params, EEPROM};
@@ -17,33 +20,37 @@ mod app {
         prelude::*,
         text::{Baseline, Text},
     };
+    use embedded_hal::digital::v2::{InputPin, OutputPin};
     use heapless::String;
-    use nb::block;
     use nmea0183::{
         coords::{Hemisphere, Latitude, Longitude},
-        ParseResult, Parser,
+        ParseResult, Parser, Sentence,
     };
     use profont::{PROFONT_18_POINT, PROFONT_9_POINT};
     use rtic::Monotonic;
-    use smart_leds::{SmartLedsWrite, RGB8};
+    use smart_leds::{SmartLedsWrite, RGB, RGB8};
     use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
     use stm32f103_rtic_playground as _;
     use stm32f1xx_hal::gpio::{
-        gpioa::PA1, gpioc::PC13, Cr, Edge, ExtiPin, Input, Output, PullUp, PushPull, CRL,
+        gpioa::{PA1, PA4},
+        gpioc::PC13,
+        Alternate, Cr, Edge, ExtiPin, Input, OpenDrain, Output, PullDown, PullUp, PushPull, CRL,
     };
+    use stm32f1xx_hal::watchdog::IndependentWatchdog;
     use stm32f1xx_hal::{
         flash::{FlashSize, Parts, SectorSize},
         i2c::{BlockingI2c, DutyCycle, Mode},
-        pac::I2C1,
+        pac::{EXTI, I2C1, TIM3},
         prelude::*,
+        pwm::{Channel, Pwm, C1},
         serial::{Config, Rx2, Serial},
         spi::{NoMiso, NoSck, Spi, Spi2NoRemap},
-        timer::{CountDownTimer, Timer},
+        timer::{Tim3NoRemap, Timer},
     };
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
     use ws2812::Ws2812;
-    use ws2812_spi as ws2812;
+    use ws2812_spi::prerendered as ws2812;
 
     struct HemisphereWrapper(Hemisphere);
     impl Format for HemisphereWrapper {
@@ -91,12 +98,8 @@ mod app {
             BlockingI2c<
                 I2C1,
                 (
-                    stm32f1xx_hal::gpio::gpiob::PB6<
-                        stm32f1xx_hal::gpio::Alternate<stm32f1xx_hal::gpio::OpenDrain>,
-                    >,
-                    stm32f1xx_hal::gpio::gpiob::PB7<
-                        stm32f1xx_hal::gpio::Alternate<stm32f1xx_hal::gpio::OpenDrain>,
-                    >,
+                    stm32f1xx_hal::gpio::gpiob::PB6<Alternate<OpenDrain>>,
+                    stm32f1xx_hal::gpio::gpiob::PB7<Alternate<OpenDrain>>,
                 ),
             >,
         >,
@@ -109,10 +112,13 @@ mod app {
     type MyMono = DwtSystick<FREQ>;
 
     const BUFF_SIZE: usize = 1024;
-    const NUM_LEDS: usize = 64;
+    const NUM_LEDS: usize = 128;
     const UTC_OFFSET: Duration = Duration::HOUR;
     const ALARM_TIME: Time = time!(6:00:00);
     const SUNRISE_LEN: Duration = Duration::minutes(30);
+    const BUZZER_BASE_FREQ_HZ: u32 = 4000;
+    const LED_LEVEL_DAY: u8 = 16;
+    const LED_LEVEL_NIGHT: u8 = 1;
 
     const EEPROM_PARAMS: Params = Params {
         first_page: 126,
@@ -153,6 +159,21 @@ mod app {
         0xFFFB00, 0xFFFC00, 0xFFFE00, 0xFFFF00,
     ];
 
+    const GAMMA8: [u8; 256] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4,
+        4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12,
+        13, 13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 24,
+        24, 25, 25, 26, 27, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 35, 35, 36, 37, 38, 39, 39, 40,
+        41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+        64, 66, 67, 68, 69, 70, 72, 73, 74, 75, 77, 78, 79, 81, 82, 83, 85, 86, 87, 89, 90, 92, 93,
+        95, 96, 98, 99, 101, 102, 104, 105, 107, 109, 110, 112, 114, 115, 117, 119, 120, 122, 124,
+        126, 127, 129, 131, 133, 135, 137, 138, 140, 142, 144, 146, 148, 150, 152, 154, 156, 158,
+        160, 162, 164, 167, 169, 171, 173, 175, 177, 180, 182, 184, 186, 189, 191, 193, 196, 198,
+        200, 203, 205, 208, 210, 213, 215, 218, 220, 223, 225, 228, 231, 233, 236, 239, 241, 244,
+        247, 249, 252, 255,
+    ];
+
     static BB: BBBuffer<BUFF_SIZE> = BBBuffer::new();
 
     pub enum DispState {
@@ -170,7 +191,7 @@ mod app {
     #[allow(non_camel_case_types)]
     pub enum LightEvent {
         SUNRISE_START,
-        TICK,
+        TICK { h: u8, m: u8, s: u8 },
     }
 
     pub enum LightState {
@@ -182,46 +203,46 @@ mod app {
     struct Shared {
         datetime: Option<PrimitiveDateTime>,
         gps_locked: bool,
-        is_sunrise: bool,
         pps_timeout: Option<pps_timeout::SpawnHandle>,
         eeprom: EEPROM<&'static mut stm32f1xx_hal::flash::Parts>,
         env_data: Option<(u16, i16)>,
+        am_pin: stm32f1xx_hal::gpio::Pin<stm32f1xx_hal::gpio::Dynamic, CRL, 'A', 0_u8>,
+        am_reset: bool,
+        buzz_subs: BuzzerEvSubs,
+        btn_pin: PA4<Input<PullUp>>,
+        exti: EXTI,
     }
+
+    type Leds = ws2812_spi::prerendered::Ws2812<
+        'static,
+        Spi<
+            stm32f1xx_hal::pac::SPI2,
+            Spi2NoRemap,
+            (
+                NoSck,
+                NoMiso,
+                stm32f1xx_hal::gpio::gpiob::PB15<stm32f1xx_hal::gpio::Alternate<PushPull>>,
+            ),
+            u8,
+        >,
+    >;
 
     #[local]
     struct Local {
         led: PC13<Output<PushPull>>,
-        pps: PA1<Input<PullUp>>,
+        pps: PA1<Input<PullDown>>,
         rx: Rx2,
         parser: Parser,
         display: Display,
-        ws: ws2812_spi::Ws2812<
-            Spi<
-                stm32f1xx_hal::pac::SPI2,
-                Spi2NoRemap,
-                (
-                    NoSck,
-                    NoMiso,
-                    stm32f1xx_hal::gpio::gpiob::PB15<
-                        stm32f1xx_hal::gpio::Alternate<stm32f1xx_hal::gpio::PushPull>,
-                    >,
-                ),
-                u8,
-            >,
-        >,
+        ws: Leds,
         leds: [RGB8; NUM_LEDS],
-        ramp: Bresenham,
         prod: bbqueue::Producer<'static, BUFF_SIZE>,
         cons: bbqueue::Consumer<'static, BUFF_SIZE>,
         dst: Duration,
-        am_pin: stm32f1xx_hal::gpio::Pin<
-            stm32f1xx_hal::gpio::Output<stm32f1xx_hal::gpio::PushPull>,
-            CRL,
-            'A',
-            0_u8,
-        >,
-        am_timer: Option<Timer<stm32f1xx_hal::pac::TIM2>>,
         am_crl: Cr<stm32f1xx_hal::gpio::CRL, 'A'>,
+        am_afio: stm32f1xx_hal::afio::Parts,
+        buzz_pwm: Pwm<TIM3, Tim3NoRemap, C1, stm32f1xx_hal::gpio::gpioa::PA6<Alternate<PushPull>>>,
+        wdg: IndependentWatchdog,
     }
 
     #[init(local = [flash: Option<Parts> = None])]
@@ -270,10 +291,15 @@ mod app {
         rx.listen();
         rx.listen_idle();
 
-        let mut pps = gpioa.pa1.into_pull_up_input(&mut gpioa.crl);
+        let mut pps = gpioa.pa1.into_pull_down_input(&mut gpioa.crl);
         pps.make_interrupt_source(&mut afio);
         pps.enable_interrupt(&mut c.device.EXTI);
-        pps.trigger_on_edge(&mut c.device.EXTI, Edge::Falling);
+        pps.trigger_on_edge(&mut c.device.EXTI, Edge::Rising);
+
+        let mut btn = gpioa.pa4.into_pull_up_input(&mut gpioa.crl);
+        btn.make_interrupt_source(&mut afio);
+        btn.enable_interrupt(&mut c.device.EXTI);
+        btn.trigger_on_edge(&mut c.device.EXTI, Edge::Falling);
 
         // Set up I2C.
         let mut gpiob = c.device.GPIOB.split();
@@ -303,9 +329,11 @@ mod app {
             NoMiso,
             gpiob.pb15.into_alternate_push_pull(&mut gpiob.crh),
         );
-        let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3.mhz(), clocks);
+        let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3500.khz(), clocks);
         let leds = [RGB8::default(); NUM_LEDS];
-        let mut ws = Ws2812::new(spi);
+
+        static mut DATA: [u8; 12 * NUM_LEDS + 20] = [0; 12 * NUM_LEDS + 20];
+        let mut ws = unsafe { Ws2812::new(spi, &mut DATA) };
         ws.write(leds.iter().cloned()).unwrap();
 
         let mut dcb = c.core.DCB;
@@ -313,16 +341,8 @@ mod app {
         let systick = c.core.SYST;
         let mono = DwtSystick::new(&mut dcb, dwt, systick, clocks.sysclk().0);
 
-        let parser = Parser::new(); //sentence_filter(Sentence::RMC | Sentence::RMC);
+        let parser = Parser::new().sentence_filter(Sentence::RMC | Sentence::RMC);
         let (prod, cons) = BB.try_split().unwrap();
-
-        let ramp = Bresenham::new(
-            (0, 0),
-            (
-                SUNRISE_LEN.whole_seconds().try_into().unwrap(),
-                SUNRISE_CMAP.len().try_into().unwrap(),
-            ),
-        );
 
         let mut eeprom = flash.eeprom(EEPROM_PARAMS);
         eeprom.init().unwrap();
@@ -336,10 +356,20 @@ mod app {
         };
         defmt::info!("DST: {}", dst.whole_hours());
 
-        let mut am_pin = gpioa.pa0.into_push_pull_output(&mut gpioa.crl);
-        am_pin.set_high();
-        let am_timer = Timer::tim2(c.device.TIM2, &clocks);
+        let buzz_pin = gpioa.pa6.into_alternate_push_pull(&mut gpioa.crl);
+        let mut buzz_pwm = Timer::new(c.device.TIM3, &clocks).pwm::<Tim3NoRemap, _, _, _>(
+            buzz_pin,
+            &mut afio.mapr,
+            BUZZER_BASE_FREQ_HZ.hz(),
+        );
+        buzz_pwm.set_duty(Channel::C1, 2 * (buzz_pwm.get_max_duty() / 100));
+
+        let mut am_pin = gpioa.pa0.into_dynamic(&mut gpioa.crl);
+        am_pin.make_push_pull_output(&mut gpioa.crl);
+        am_pin.set_high().unwrap();
         let am_crl = gpioa.crl;
+
+        let wdg = IndependentWatchdog::new(c.device.IWDG);
 
         display::spawn_after(50.millis(), DispEvent::INIT).unwrap();
 
@@ -347,10 +377,14 @@ mod app {
             Shared {
                 datetime: None,
                 gps_locked: false,
-                is_sunrise: false,
                 pps_timeout: None,
                 eeprom,
                 env_data: None,
+                am_pin,
+                am_reset: true,
+                buzz_subs: BuzzerEvSubs::CHIMES,
+                btn_pin: btn,
+                exti: c.device.EXTI,
             },
             Local {
                 led,
@@ -360,13 +394,13 @@ mod app {
                 display,
                 ws,
                 leds,
-                ramp,
                 prod,
                 cons,
                 dst,
-                am_pin,
-                am_timer: Some(am_timer),
                 am_crl,
+                am_afio: afio,
+                buzz_pwm,
+                wdg,
             },
             init::Monotonics(mono),
         )
@@ -497,8 +531,12 @@ mod app {
                         gga.gps_quality as u8
                     );
                 }
-                Ok(_) => {}
-                Err(_) => {}
+                Ok(_) => {
+                    defmt::debug!("Incomplete NMEA")
+                }
+                Err(e) => {
+                    defmt::debug!("NMEA parsing error: {}", e)
+                }
             }
         }
 
@@ -506,22 +544,22 @@ mod app {
         rgr.release(len);
     }
 
-    #[task(binds = EXTI1, shared = [datetime, gps_locked, is_sunrise, pps_timeout, eeprom],
-                           local = [pps, dst, am_tm: u8 = 2], priority = 16)]
+    #[task(binds = EXTI1, shared = [datetime, gps_locked, pps_timeout, eeprom, buzz_subs],
+                           local = [pps, dst], priority = 16)]
     fn pps_isr(cx: pps_isr::Context) {
         let pps_isr::SharedResources {
             datetime,
             gps_locked,
-            is_sunrise,
             pps_timeout,
             eeprom,
+            mut buzz_subs,
         } = cx.shared;
 
         cx.local.pps.clear_interrupt_pending_bit();
 
         defmt::debug!("pps");
-        let (dt, gps) = (datetime, gps_locked, is_sunrise, pps_timeout, eeprom).lock(
-            |dt, gps_locked, is_sunrise, pps_timeout, eeprom| {
+        let (dt, gps) = (datetime, gps_locked, pps_timeout, eeprom).lock(
+            |dt, gps_locked, pps_timeout, eeprom| {
                 if let Some(mut dt_) = *dt {
                     *dt = Some(dt_ + Duration::SECOND);
                     dt_ += Duration::SECOND;
@@ -537,15 +575,18 @@ mod app {
                     if *gps_locked {
                         *pps_timeout = pps_timeout::spawn_after(900.millis()).ok();
                     }
-                    if !*is_sunrise {
-                        if (![Weekday::Saturday, Weekday::Sunday].contains(&dt_.date().weekday()))
-                            && dt_.time() == (ALARM_TIME - SUNRISE_LEN)
-                        {
-                            *is_sunrise = true;
+
+                    if ![Weekday::Saturday, Weekday::Sunday].contains(&dt_.date().weekday()) {
+                        if dt_.time() == (ALARM_TIME - SUNRISE_LEN) {
                             light::spawn(LightEvent::SUNRISE_START).unwrap();
                         }
-                    } else {
-                        light::spawn(LightEvent::TICK).unwrap();
+                    }
+
+                    let (h, m, s) = dt_.time().as_hms();
+                    light::spawn(LightEvent::TICK { h, m, s }).unwrap();
+
+                    if dt_.time() == ALARM_TIME {
+                        buzzer::spawn(BuzzerEvent::Alarm).unwrap();
                     }
                     (Some(dt_), *gps_locked)
                 } else {
@@ -555,13 +596,39 @@ mod app {
         );
         if let Some(dt) = dt {
             display::spawn(DispEvent::UPDATE { dt: dt, gps: gps }).unwrap();
+            buzz_subs.lock(|subs| {
+                if !(*subs & BuzzerEvSubs::CHIMES).is_empty() {
+                    let (h, s) = (dt.time().hour(), dt.time().second());
+                    if h < 22 && h > 7 {
+                        match dt.time().minute() {
+                            0 => {
+                                if s == 0 {
+                                    buzzer::spawn(BuzzerEvent::HourChime).unwrap();
+                                } else {
+                                    buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+                                }
+                            }
+                            59 => {
+                                if s > 56 {
+                                    buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
+                                } else {
+                                    buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+                                }
+                            }
+                            15 | 30 | 45 => {
+                                if s == 0 {
+                                    buzzer::spawn(BuzzerEvent::QuarterChime).unwrap()
+                                } else {
+                                    buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+                                }
+                            }
+                            _ => buzzer::spawn(BuzzerEvent::SecondTick).unwrap(),
+                        }
+                    }
+                }
+            })
         }
-        if *cx.local.am_tm == 0 {
-            am_sensor::spawn_after(600.millis()).unwrap();
-            *cx.local.am_tm = 10;
-        } else {
-            *cx.local.am_tm -= 1;
-        }
+        am_sensor::spawn_after(800.millis(), AmSensorEvent::START).unwrap();
     }
 
     #[task(shared = [gps_locked], local = [], priority = 2)]
@@ -651,59 +718,140 @@ mod app {
         }
     }
 
-    #[task(shared = [is_sunrise], local = [ws, leds, ramp, state: LightState = LightState::OFF], priority = 1)]
+    fn leds_write(ws: &mut Leds, leds: &[RGB<u8>; NUM_LEDS]) {
+        for retries in 0..10 {
+            let ret = ws.write(leds.iter().cloned());
+            match ret {
+                Ok(_) => break,
+                Err(_) => {
+                    if retries == 9 {
+                        defmt::panic!();
+                    } else {
+                        defmt::warn!("Writing to LEDs failed")
+                    }
+                }
+            }
+        }
+    }
+
+    #[task(shared = [], local = [ws, ramp: Option<Peekable<Bresenham>> = None,
+                                leds, state: LightState = LightState::OFF], priority = 4, capacity = 2)]
     fn light(cx: light::Context, ev: LightEvent) {
         let ws = cx.local.ws;
         let leds = cx.local.leds;
         let ramp = cx.local.ramp;
-        let s = cx.local.state;
-        let mut is_sunrise = cx.shared.is_sunrise;
+        let state = cx.local.state;
 
-        match s {
+        match state {
             LightState::OFF => match ev {
                 LightEvent::SUNRISE_START => {
-                    for i in 0..leds.len() {
-                        leds[i] = RGB8::default();
-                    }
-                    ws.write(leds.iter().cloned()).unwrap();
-                    *s = LightState::SUNRISE { prev_val: None };
+                    defmt::info!("Starting sunrise");
+
+                    *ramp = Some(
+                        Bresenham::new(
+                            (0, 0),
+                            (
+                                SUNRISE_LEN.whole_seconds().try_into().unwrap(),
+                                SUNRISE_CMAP.len().try_into().unwrap(),
+                            ),
+                        )
+                        .peekable(),
+                    );
+                    *state = LightState::SUNRISE { prev_val: None };
                 }
-                _ => {
-                    defmt::panic!();
+                LightEvent::TICK { h, m, s } => {
+                    let mut buf: String<4> = String::new();
+                    buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
+
+                    let l = if h > 20 || h < 6 {
+                        LED_LEVEL_NIGHT
+                    } else {
+                        LED_LEVEL_DAY
+                    };
+
+                    *leds = leds.map(|_| RGB8::default());
+                    for i in 0..(s / 4) {
+                        leds[leds_xy_to_n(i as usize, 0)] = RGB8 {
+                            r: 0,
+                            g: l + 1,
+                            b: 0,
+                        };
+                    }
+
+                    leds[leds_xy_to_n((s / 4) as usize, 0)] = RGB8 {
+                        r: 0,
+                        g: 1 + (l * (s % 4) / 3),
+                        b: 0,
+                    };
+
+                    for (x, mut d) in buf.bytes().enumerate() {
+                        d -= '0' as u8;
+                        leds_draw_digit(leds, 1 + (4 * x), 2, d as u8, RGB8 { r: l, g: 0, b: 0 });
+                    }
+                    leds_write(ws, leds);
                 }
             },
             LightState::SUNRISE { prev_val } => match ev {
-                LightEvent::TICK => {
+                LightEvent::TICK { h: _, m: _, s: _ } => {
                     defmt::debug!("tick");
-                    match ramp.next() {
-                        Some((_, y)) => {
-                            if let Some(y) = match prev_val {
-                                None => Some(y),
-                                Some(v) => {
-                                    if *v == y {
-                                        None
-                                    } else {
-                                        Some(y)
+
+                    let v;
+                    if let Some(ramp) = ramp {
+                        loop {
+                            match ramp.next() {
+                                Some((cx, cy)) => match ramp.peek() {
+                                    Some((nx, _)) => {
+                                        if cx != *nx {
+                                            v = Some(cy);
+                                            break;
+                                        } else {
+                                            continue;
+                                        }
                                     }
+                                    None => {
+                                        v = Some(cy);
+                                        break;
+                                    }
+                                },
+                                None => {
+                                    v = None;
+                                    break;
                                 }
-                            } {
-                                let v: u32 = SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()];
-                                let c = RGB8 {
-                                    b: v as u8,
-                                    g: (v >> 8) as u8,
-                                    r: (v >> 16) as u8,
-                                };
-                                *leds = leds.map(|_| c);
-                                ws.write(leds.iter().cloned()).unwrap();
-                                *prev_val = Some(y);
                             }
                         }
-                        None => {
-                            *leds = leds.map(|_| RGB8::default());
-                            ws.write(leds.iter().cloned()).unwrap();
-                            is_sunrise.lock(|is_sunrise| *is_sunrise = false);
-                            *s = LightState::OFF;
+
+                        match v {
+                            Some(y) => {
+                                if let Some(y) = match prev_val {
+                                    None => Some(y),
+                                    Some(v) => {
+                                        if *v == y {
+                                            None
+                                        } else {
+                                            Some(y)
+                                        }
+                                    }
+                                } {
+                                    let v: u32 =
+                                        SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()];
+                                    let c = RGB8 {
+                                        b: GAMMA8[(v & 0xFF) as usize],
+                                        g: GAMMA8[((v >> 8) & 0xFF) as usize],
+                                        r: GAMMA8[((v >> 16) & 0xFF) as usize],
+                                    };
+                                    *leds = leds.map(|_| c);
+                                    leds_write(ws, leds);
+                                    *prev_val = Some(y);
+                                }
+                            }
+                            None => {
+                                *leds = leds.map(|_| RGB8::default());
+                                leds_write(ws, leds);
+                                *state = LightState::OFF;
+                            }
                         }
+                    } else {
+                        defmt::panic!();
                     }
                 }
                 _ => {
@@ -713,149 +861,747 @@ mod app {
         }
     }
 
-    fn wait_for_state(
-        timer: &mut CountDownTimer<stm32f1xx_hal::pac::TIM2>,
-        pin: &mut stm32f1xx_hal::gpio::Pin<
-            stm32f1xx_hal::gpio::Input<stm32f1xx_hal::gpio::PullUp>,
-            stm32f1xx_hal::gpio::CRL,
-            'A',
-            0_u8,
-        >,
-        state: bool,
-    ) -> Result<bool, nb::Error<void::Void>> {
-        if pin.is_high() == state {
-            return Ok(true);
-        } else {
-            let res = timer.wait();
-            return match res {
-                Ok(_) => Ok(false),
-                Err(e) => Err(e),
-            };
+    pub enum AmSensorState {
+        START1,
+        START2,
+        ACK1,
+        ACK2,
+        RX,
+    }
+
+    #[derive(Debug, PartialEq, Format)]
+    pub enum AmSensorEvent {
+        START,
+        DATA { data: [u16; 5] },
+        TIMEOUT,
+    }
+
+    #[task(binds = EXTI0, shared = [am_pin, am_reset],
+                          local = [last: u32 = 0,
+                                   i: usize = 0,
+                                   data: [u16; 5] = [0; 5]], priority = 2)]
+    fn am_data_isr(cx: am_data_isr::Context) {
+        let pin_r = cx.shared.am_pin;
+        let reset_r = cx.shared.am_reset;
+        let i = cx.local.i;
+        let data = cx.local.data;
+
+        (pin_r, reset_r).lock(|pin, reset| {
+            pin.clear_interrupt_pending_bit();
+            if *reset {
+                *i = 0;
+                *cx.local.last = 0;
+                *reset = false;
+            }
+        });
+        *i += 1;
+        let curr = monotonics::now().ticks();
+        let len = (curr - *cx.local.last) / 72;
+
+        if *i > 2 {
+            if (*i % 2) == 1 {
+                if !(len >= 40 && len < 70) {
+                    defmt::warn!("Wrong preamble length");
+                }
+            } else {
+                let j = (*i - 4) / 2;
+                let (n, m) = ((j / 8), 7 - (j % 8));
+                match len {
+                    20..=40 => {
+                        data[n] &= !(1 << m);
+                    }
+                    60..=80 => {
+                        data[n] |= 1 << m;
+                    }
+                    _ => defmt::warn!("Wrong bit length"),
+                }
+            }
+            if *i >= 83 {
+                defmt::debug!("Sensor data: {}", data);
+                *i = 0;
+                am_sensor::spawn(AmSensorEvent::DATA { data: data.clone() }).unwrap();
+            }
+        }
+        *cx.local.last = curr;
+    }
+
+    #[task(shared = [env_data, am_pin, am_reset, exti], local = [am_crl, am_afio,
+                                                 state: AmSensorState = AmSensorState::START1,
+                                                 handle: Option<am_sensor::SpawnHandle> = None,
+                                                 count: u16 = 0],
+                                                 priority = 1, capacity = 2)]
+    fn am_sensor(cx: am_sensor::Context, ev: AmSensorEvent) {
+        let mut pin_r = cx.shared.am_pin;
+        let mut crl = cx.local.am_crl;
+        let mut env_data_r = cx.shared.env_data;
+        let mut afio = cx.local.am_afio;
+        let mut exti = cx.shared.exti;
+        let mut reset_r = cx.shared.am_reset;
+
+        let handle = cx.local.handle;
+
+        let s = cx.local.state;
+
+        pin_r.lock(|pin| match s {
+            AmSensorState::START1 => {
+                if ev == AmSensorEvent::START {
+                    pin.make_push_pull_output(&mut crl);
+                    pin.set_low().unwrap();
+                    am_sensor::spawn_after(20.millis(), AmSensorEvent::TIMEOUT).unwrap();
+                    reset_r.lock(|reset| {
+                        *reset = true;
+                    });
+                    *s = AmSensorState::START2;
+                } else {
+                    defmt::warn!("Unexpected event {}. Ignoring", ev);
+                }
+            }
+            AmSensorState::START2 => {
+                defmt::assert!(ev == AmSensorEvent::TIMEOUT);
+                pin.set_high().unwrap();
+                am_sensor::spawn_after(20.micros(), AmSensorEvent::TIMEOUT).unwrap();
+                *s = AmSensorState::ACK1;
+            }
+            AmSensorState::ACK1 => {
+                defmt::assert!(ev == AmSensorEvent::TIMEOUT);
+                pin.make_pull_up_input(&mut crl);
+                am_sensor::spawn_after(30.micros(), AmSensorEvent::TIMEOUT).unwrap();
+                *s = AmSensorState::ACK2;
+            }
+            AmSensorState::ACK2 => {
+                defmt::assert!(ev == AmSensorEvent::TIMEOUT);
+                if pin.is_low().unwrap() {
+                    pin.make_interrupt_source(&mut afio);
+
+                    exti.lock(|exti| {
+                        pin.enable_interrupt(exti);
+                        pin.trigger_on_edge(exti, Edge::RisingFalling);
+                    });
+                    *handle = am_sensor::spawn_after(10.millis(), AmSensorEvent::TIMEOUT).ok();
+                    *s = AmSensorState::RX;
+                } else {
+                    defmt::warn!("Sensor not responding");
+                    env_data_r.lock(|env_data| *env_data = None);
+                    *s = AmSensorState::START1;
+                }
+            }
+            AmSensorState::RX => {
+                match ev {
+                    AmSensorEvent::DATA { data } => {
+                        if let Some(handle) = handle.take() {
+                            handle.cancel().ok();
+                        }
+                        let crc: u16 = data.split_last().unwrap().1.iter().sum();
+
+                        let crc_exp: u8 = data[4] as u8;
+                        let temp: u16 = (data[2] << 8) | data[3];
+                        let humi: u16 = (data[0] << 8) | data[1];
+
+                        let signed_temp = if temp & 0x8000 != 0 {
+                            -((temp & 0x7FF) as i16)
+                        } else {
+                            temp as i16
+                        };
+
+                        defmt::info!("Temp: {},  RHS: {}", signed_temp, humi);
+                        if crc as u8 != crc_exp {
+                            defmt::warn!("Wrong CRC");
+                        }
+                        env_data_r.lock(|env_data| *env_data = Some((humi, signed_temp)));
+                    }
+                    AmSensorEvent::TIMEOUT => {
+                        defmt::warn!("Timeout");
+                    }
+                    _ => {
+                        defmt::panic!()
+                    }
+                }
+
+                exti.lock(|exti| {
+                    pin.disable_interrupt(exti);
+                });
+                pin.clear_interrupt_pending_bit();
+                *s = AmSensorState::START1;
+            }
+        });
+    }
+
+    pub enum BuzzerState {
+        Chime {
+            is_on: bool,
+            chime: Option<Iter<'static, u32>>,
+        },
+        Alarm {
+            is_pause: bool,
+            dur: u16,
+            alarm: Iter<'static, (u16, u16)>,
+            iter: Iter<'static, (u16, u16)>,
+        },
+    }
+
+    #[derive(Debug, PartialEq, Format)]
+    pub enum BuzzerEvent {
+        HourChime,
+        QuarterChime,
+        SecondTick,
+        Next,
+        Alarm,
+        Button,
+    }
+
+    bitflags! {
+        pub struct BuzzerEvSubs: u8 {
+            const CHIMES = 0b00000001;
+            const ALARM = 0b00000010;
         }
     }
 
-    #[task(shared = [env_data], local = [am_pin, am_timer, am_crl], priority = 1)]
-    fn am_sensor(cx: am_sensor::Context) {
-        let timer = cx.local.am_timer;
-        let pin = cx.local.am_pin;
-        let mut crl = cx.local.am_crl;
-        let mut env_data_r = cx.shared.env_data;
+    const ALARMS: &'static [&'static [(u16, u16)]] = &[
+        &[
+            (0, 42),
+            (1175, 167),
+            (784, 167),
+            (784, 167),
+            (1175, 167),
+            (784, 167),
+            (784, 167),
+            (1175, 167),
+            (784, 167),
+            (1244, 167),
+            (784, 167),
+            (1175, 167),
+            (784, 167),
+            (784, 167),
+            (1175, 167),
+            (784, 167),
+            (784, 167),
+            (1175, 167),
+            (784, 167),
+            (1244, 167),
+            (784, 167),
+            (1109, 167),
+            (740, 167),
+            (740, 167),
+            (1109, 167),
+            (740, 167),
+            (740, 167),
+            (1109, 167),
+            (740, 167),
+            (1175, 167),
+            (740, 167),
+            (1109, 167),
+            (740, 167),
+            (740, 167),
+            (1109, 167),
+            (740, 167),
+            (740, 167),
+            (1109, 167),
+            (740, 167),
+            (1175, 167),
+            (740, 167),
+        ],
+        &[
+            (659, 333),
+            (659, 333),
+            (587, 167),
+            (659, 333),
+            (784, 333),
+            (659, 1000),
+            (0, 333),
+            (1318, 500),
+            (1976, 500),
+            (1760, 500),
+            (1568, 500),
+            (1397, 333),
+            (659, 333),
+            (659, 333),
+            (587, 167),
+            (659, 333),
+            (784, 333),
+            (659, 1000),
+            (0, 333),
+            (1318, 500),
+            (1976, 500),
+            (1760, 500),
+            (1568, 500),
+            (1397, 333),
+            (698, 333),
+            (698, 333),
+            (698, 167),
+            (698, 333),
+            (698, 333),
+            (698, 1000),
+            (698, 333),
+            (698, 167),
+            (698, 333),
+            (698, 333),
+            (698, 333),
+            (698, 333),
+            (698, 333),
+            (784, 333),
+            (698, 500),
+            (659, 667),
+            (659, 333),
+            (659, 333),
+            (587, 167),
+            (659, 333),
+            (784, 333),
+            (659, 1000),
+            (0, 333),
+            (1318, 500),
+            (1976, 500),
+            (1760, 500),
+            (1568, 500),
+            (1397, 333),
+            (659, 333),
+            (659, 333),
+            (587, 167),
+            (659, 333),
+            (784, 333),
+            (659, 1000),
+            (0, 333),
+            (1318, 500),
+            (1976, 500),
+            (1760, 500),
+            (1568, 500),
+            (1397, 333),
+            (698, 333),
+            (698, 333),
+            (698, 167),
+            (698, 333),
+            (698, 333),
+            (698, 1000),
+            (698, 333),
+            (698, 167),
+            (698, 333),
+            (698, 333),
+            (698, 333),
+            (698, 333),
+            (698, 333),
+            (784, 333),
+            (698, 500),
+            (659, 667),
+        ],
+        &[
+            (659, 480),
+            (988, 480),
+            (880, 480),
+            (988, 480),
+            (1175, 480),
+            (988, 1440),
+            (0, 1920),
+            (659, 480),
+            (988, 480),
+            (880, 480),
+            (988, 480),
+            (1318, 480),
+            (988, 1440),
+            (1568, 480),
+            (1397, 480),
+            (1318, 480),
+            (1175, 480),
+            (1397, 480),
+            (988, 1440),
+            (0, 1920),
+            (659, 480),
+            (988, 480),
+            (880, 480),
+            (988, 480),
+            (1175, 480),
+            (988, 1440),
+            (0, 1920),
+            (1318, 480),
+            (988, 1440),
+        ],
+        &[
+            (0, 47),
+            (1568, 188),
+            (1568, 188),
+            (1568, 188),
+            (1568, 375),
+            (1318, 375),
+            (1568, 188),
+            (1760, 188),
+            (1568, 188),
+            (1397, 188),
+            (1568, 375),
+            (1046, 375),
+            (1568, 188),
+            (1760, 188),
+            (1568, 188),
+            (1397, 188),
+            (1568, 375),
+            (1318, 375),
+            (1046, 188),
+            (1175, 1125),
+            (0, 375),
+            (1318, 562),
+            (880, 375),
+            (1046, 375),
+            (1318, 188),
+            (1480, 188),
+            (1318, 188),
+            (1175, 188),
+            (1318, 375),
+            (880, 375),
+            (1318, 188),
+            (1480, 188),
+            (1318, 188),
+            (1175, 188),
+            (1318, 375),
+            (880, 375),
+            (784, 188),
+            (880, 750),
+        ],
+        &[
+            (880, 120),
+            (659, 120),
+            (0, 120),
+            (659, 120),
+            (0, 120),
+            (659, 120),
+            (784, 120),
+            (0, 120),
+            (698, 120),
+            (698, 120),
+            (698, 120),
+            (698, 120),
+            (698, 120),
+            (740, 120),
+            (0, 120),
+            (740, 120),
+            (988, 120),
+            (659, 120),
+            (0, 120),
+            (659, 120),
+            (0, 120),
+            (659, 120),
+            (880, 120),
+            (0, 120),
+            (784, 120),
+            (784, 120),
+            (784, 120),
+            (784, 120),
+            (784, 120),
+            (831, 120),
+        ],
+        &[
+            (1480, 375),
+            (1480, 375),
+            (1318, 188),
+            (1318, 375),
+            (1175, 375),
+            (1175, 375),
+            (988, 562),
+            (740, 375),
+            (988, 188),
+            (988, 188),
+            (988, 375),
+            (988, 188),
+            (1175, 375),
+            (1175, 375),
+            (1318, 375),
+            (1175, 562),
+            (988, 375),
+            (1480, 375),
+            (1480, 375),
+            (1318, 188),
+            (1318, 375),
+            (1175, 375),
+            (1175, 375),
+            (988, 562),
+            (740, 375),
+            (988, 375),
+            (988, 375),
+            (988, 188),
+            (1175, 375),
+            (1175, 375),
+            (1318, 375),
+            (1175, 562),
+            (988, 375),
+            (1480, 375),
+            (1480, 375),
+            (1318, 188),
+            (1318, 375),
+            (1175, 375),
+            (1175, 375),
+            (988, 562),
+            (740, 375),
+            (988, 188),
+            (988, 188),
+            (988, 375),
+            (988, 188),
+            (1175, 375),
+            (1175, 375),
+            (1318, 375),
+            (1175, 562),
+            (988, 375),
+            (1480, 375),
+            (1480, 375),
+            (1318, 188),
+            (1318, 375),
+            (1175, 375),
+            (1175, 375),
+            (988, 562),
+            (740, 375),
+            (988, 375),
+            (988, 375),
+            (988, 188),
+            (1175, 375),
+            (1175, 375),
+            (1318, 375),
+            (1175, 562),
+            (988, 375),
+        ],
+    ];
 
-        let mut temp: u16 = 0;
-        let mut humi: u16 = 0;
-        let mut crc: u8 = 0;
+    #[task(local = [buzz_pwm,
+                    state: BuzzerState = BuzzerState::Chime {is_on: false, chime: None},
+                    handle: Option<buzzer::SpawnHandle> = None,
+                    curr_al: usize = 0],
+           shared = [buzz_subs],
+           priority = 2,
+           capacity = 2)]
+    fn buzzer(cx: buzzer::Context, ev: BuzzerEvent) {
+        const HOUR_CHIME: [u32; 3] = [100, 80, 50];
+        const QUARTER_CHIME: [u32; 1] = [50];
+        const SECOND_TICK: [u32; 1] = [1];
 
-        if let Some(tm) = timer.take() {
-            let mut cd = tm.start_count_down(1000.ms());
-            //START
-            pin.as_push_pull_output(&mut crl, |out| {
-                let mut s = || -> Result<(), void::Void> {
-                    out.set_low();
-                    cd.start(20.ms());
-                    block!(cd.wait())?;
-                    out.set_high();
-                    cd.start(25.us());
-                    block!(cd.wait())?;
-                    Ok(())
-                };
-                if let Err(_) = s() {
-                    defmt::error!("Failed in START");
-                    return;
+        let buzzer = cx.local.buzz_pwm;
+        let s = cx.local.state;
+        let mut buzz_subs = cx.shared.buzz_subs;
+        let curr_al = cx.local.curr_al;
+        let handle = cx.local.handle;
+
+        match s {
+            BuzzerState::Chime { is_on, chime } => match ev {
+                BuzzerEvent::Alarm => {
+                    buzz_subs.lock(|subs| {
+                        *subs = BuzzerEvSubs::ALARM;
+                    });
+                    *s = BuzzerState::Alarm {
+                        is_pause: false,
+                        dur: 0,
+                        alarm: ALARMS[*curr_al].iter(),
+                        iter: ALARMS[*curr_al].iter(),
+                    };
+                    buzzer::spawn(BuzzerEvent::Next).unwrap();
                 }
-            });
-
-            //DATA
-            pin.as_pull_up_input(&mut crl, |inp| {
-                let mut s = || -> Result<(u16, i16), &str> {
-                    if !inp.is_low() {
-                        return Err("not low before ACK");
-                    }
-                    cd.start(100.us());
-                    let res = block!(wait_for_state(&mut cd, inp, true)).unwrap();
-                    if !res {
-                        return Err("error in ACK 1");
-                    }
-
-                    cd.start(100.us());
-                    let res = block!(wait_for_state(&mut cd, inp, false)).unwrap();
-                    if !res {
-                        return Err("error in ACK 2");
-                    }
-
-                    for i in 0..40 {
-                        cd.start(80.us());
-                        let res = block!(wait_for_state(&mut cd, inp, true)).unwrap();
-                        if !res {
-                            return Err("error in DATA 1");
+                _ => {
+                    match ev {
+                        BuzzerEvent::HourChime => *chime = Some(HOUR_CHIME.iter()),
+                        BuzzerEvent::QuarterChime => *chime = Some(QUARTER_CHIME.iter()),
+                        BuzzerEvent::SecondTick => *chime = Some(SECOND_TICK.iter()),
+                        BuzzerEvent::Next => (),
+                        BuzzerEvent::Button => {
+                            *curr_al += 1;
+                            if *curr_al >= ALARMS.len() {
+                                *curr_al = 0;
+                            }
+                            buzzer::spawn(BuzzerEvent::Alarm).unwrap();
+                            return ();
                         }
+                        BuzzerEvent::Alarm => {
+                            defmt::panic!();
+                        }
+                    }
 
-                        cd.start(35.us());
-                        let res = block!(wait_for_state(&mut cd, inp, false)).unwrap();
-                        if res == false {
-                            cd.start(55.us());
-                            let res = block!(wait_for_state(&mut cd, inp, false)).unwrap();
-                            if res == true {
-                                if i < 16 {
-                                    humi |= 1 << (15 - i);
-                                } else if i < 32 {
-                                    temp |= 1 << (15 - (i - 16));
+                    if let Some(i) = chime {
+                        match i.next() {
+                            None => {
+                                buzzer.disable(Channel::C1);
+                                *is_on = false;
+                                *chime = None;
+                            }
+                            Some(delay) => {
+                                if *is_on {
+                                    buzzer.disable(Channel::C1);
+                                    *is_on = false;
                                 } else {
-                                    crc |= 1 << (7 - (i - 32));
+                                    buzzer.set_period(BUZZER_BASE_FREQ_HZ.hz());
+                                    buzzer.enable(Channel::C1);
+                                    *is_on = true;
                                 }
-                            } else {
-                                return Err("error in DATA 2");
+                                buzzer::spawn_after(delay.millis(), BuzzerEvent::Next).unwrap();
                             }
                         }
                     }
-
-                    let t = if temp & 0x8000 != 0 {
-                        -((temp & 0x7FF) as i16)
-                    } else {
-                        temp as i16
-                    };
-                    defmt::debug!(
-                        "Temperature: {}.{}C, Humidity: {}.{}%, CRC: {}",
-                        humi / 10,
-                        humi % 10,
-                        t / 10,
-                        t % 10,
-                        crc
-                    );
-                    let crc_ex: u8 = ((humi) + (humi >> 8) + (temp) + (temp >> 8)) as u8;
-                    if crc != crc_ex {
-                        defmt::warn!("Wrong CRC. Expected: {}, got: {}", crc_ex, crc);
-                    }
-                    Ok((humi, t))
-                };
-                match s() {
-                    Err(e) => {
-                        defmt::error!("Failed in DATA: {}", e);
-                        env_data_r.lock(|env_data| *env_data = None);
-                    }
-                    Ok(data) => env_data_r.lock(|env_data| *env_data = Some(data)),
                 }
-            });
-
-            // Not sure why this is needed, but it's needed
-            // Probably bug in HAL
-            pin.as_push_pull_output(&mut crl, |out| {
-                cd.start(5.us());
-                block!(cd.wait()).ok();
-                out.set_high();
-            });
-
-            *timer = Some(cd.stop());
-        } else {
-            defmt::panic!();
+            },
+            BuzzerState::Alarm {
+                is_pause,
+                dur,
+                alarm,
+                iter,
+            } => match ev {
+                BuzzerEvent::Next => {
+                    if *is_pause {
+                        *is_pause = false;
+                        buzzer.disable(Channel::C1);
+                        buzzer::spawn_after(((*dur / 10) as u32).millis(), BuzzerEvent::Next)
+                            .unwrap();
+                    } else {
+                        match alarm.next() {
+                            Some((freq, dur_)) => {
+                                defmt::debug!(
+                                    "Playing: frequency = {}Hz, duration = {} ms",
+                                    freq,
+                                    dur
+                                );
+                                if *freq > 0 {
+                                    buzzer.set_period((*freq as u32).hz());
+                                    buzzer.enable(Channel::C1);
+                                }
+                                *is_pause = true;
+                                *dur = *dur_;
+                                *handle = buzzer::spawn_after(
+                                    ((*dur_ - (*dur_ / 10)) as u32).millis(),
+                                    BuzzerEvent::Next,
+                                )
+                                .ok();
+                            }
+                            None => {
+                                *alarm = iter.clone();
+                                *handle = buzzer::spawn_after(1.secs(), BuzzerEvent::Next).ok();
+                            }
+                        }
+                    }
+                }
+                BuzzerEvent::Button => {
+                    buzz_subs.lock(|subs| {
+                        *subs = BuzzerEvSubs::CHIMES;
+                    });
+                    buzzer.disable(Channel::C1);
+                    if let Some(handle) = handle.take() {
+                        handle.cancel().ok();
+                    }
+                    *s = BuzzerState::Chime {
+                        is_on: false,
+                        chime: None,
+                    };
+                }
+                _ => {}
+            },
         }
     }
 
-    #[idle(local = [led])]
+    #[rustfmt::skip]
+    const _LED_DIGITS: [[u8; 5]; 10] =
+                                      [[0b111,
+                                        0b101,
+                                        0b101,
+                                        0b101,
+                                        0b111],
+
+                                       [0b010,
+                                        0b110,
+                                        0b010,
+                                        0b010,
+                                        0b010],
+
+                                       [0b111,
+                                        0b001,
+                                        0b111,
+                                        0b100,
+                                        0b111],
+
+                                       [0b111,
+                                        0b001,
+                                        0b111,
+                                        0b001,
+                                        0b111],
+                                        
+                                       [0b101,
+                                        0b101,
+                                        0b111,
+                                        0b001,
+                                        0b001],
+
+                                       [0b111,
+                                        0b100,
+                                        0b111,
+                                        0b001,
+                                        0b111],
+
+                                       [0b111,
+                                        0b100,
+                                        0b111,
+                                        0b101,
+                                        0b111],
+
+                                       [0b111,
+                                        0b101,
+                                        0b001,
+                                        0b001,
+                                        0b001],
+
+                                       [0b111,
+                                        0b101,
+                                        0b111,
+                                        0b101,
+                                        0b111],
+
+                                       [0b111,
+                                        0b101,
+                                        0b111,
+                                        0b001,
+                                        0b111],
+                                        ];
+
+    fn leds_xy_to_n(x: usize, y: usize) -> usize {
+        let _y = 7 - y;
+        let _x = 15 - x;
+        let n = if _x > 7 { NUM_LEDS / 2 } else { 0 };
+        return n + (_y * 8) + (_x % 8);
+    }
+
+    fn leds_draw_digit(leds: &mut [RGB8; NUM_LEDS], x: usize, y: usize, d: u8, color: RGB8) {
+        for (j, bits) in _LED_DIGITS[d as usize].iter().enumerate() {
+            for i in 0..3 {
+                if bits & (1 << (2 - i)) != 0 {
+                    leds[leds_xy_to_n(i + x, j + y)] = color;
+                }
+            }
+        }
+    }
+
+    #[task(binds = EXTI4, shared = [btn_pin, exti],
+        local = [], priority = 2)]
+    fn button_isr(cx: button_isr::Context) {
+        let btn = cx.shared.btn_pin;
+        let exti = cx.shared.exti;
+
+        (btn, exti).lock(|btn, exti| {
+            btn.disable_interrupt(exti);
+            btn.clear_interrupt_pending_bit();
+            btn_debouncer::spawn_after(20.millis()).unwrap();
+        });
+    }
+
+    #[task(local = [],
+        shared = [btn_pin, exti],
+        priority = 2)]
+    fn btn_debouncer(cx: btn_debouncer::Context) {
+        let btn = cx.shared.btn_pin;
+        let exti = cx.shared.exti;
+
+        (btn, exti).lock(|btn, exti| {
+            if btn.is_low() {
+                buzzer::spawn(BuzzerEvent::Button).ok();
+            }
+            btn.enable_interrupt(exti);
+        });
+    }
+
+    #[idle(local = [led, wdg])]
     fn idle(cx: idle::Context) -> ! {
+        cx.local.wdg.start(4000.ms());
+
         loop {
             cx.local.led.set_high();
             rtic::export::wfi();
             cx.local.led.set_low();
+            cx.local.wdg.feed();
         }
     }
 }
