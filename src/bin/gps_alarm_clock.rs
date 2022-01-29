@@ -189,13 +189,8 @@ mod app {
     #[derive(Debug)]
     #[allow(non_camel_case_types)]
     pub enum LightEvent {
-        SUNRISE_START,
+        SOLID_COLOR { color: RGB8 },
         TICK { h: u8, m: u8, s: u8 },
-    }
-
-    pub enum LightState {
-        OFF,
-        SUNRISE { prev_val: Option<isize> },
     }
 
     #[shared]
@@ -370,6 +365,7 @@ mod app {
         let wdg = IndependentWatchdog::new(c.device.IWDG);
 
         display::spawn_after(50.millis(), DispEvent::INIT).unwrap();
+        main_sm::spawn_after(2.secs(), MainEvent::Timeout).unwrap();
 
         (
             Shared {
@@ -684,142 +680,59 @@ mod app {
         }
     }
 
-    #[task(shared = [], local = [ws, ramp: Option<Peekable<Bresenham>> = None,
-                                leds, state: LightState = LightState::OFF], priority = 4, capacity = 2)]
+    #[task(shared = [], local = [ws, leds], priority = 4, capacity = 2)]
     fn light(cx: light::Context, ev: LightEvent) {
         let ws = cx.local.ws;
         let leds = cx.local.leds;
-        let ramp = cx.local.ramp;
-        let state = cx.local.state;
 
-        match state {
-            LightState::OFF => match ev {
-                LightEvent::SUNRISE_START => {
-                    defmt::info!("Starting sunrise");
+        match ev {
+            LightEvent::TICK { h, m, s } => {
+                let mut buf: String<4> = String::new();
+                buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
 
-                    *ramp = Some(
-                        Bresenham::new(
-                            (0, 0),
-                            (
-                                SUNRISE_LEN.whole_seconds().try_into().unwrap(),
-                                SUNRISE_CMAP.len().try_into().unwrap(),
-                            ),
-                        )
-                        .peekable(),
-                    );
-                    *state = LightState::SUNRISE { prev_val: None };
-                }
-                LightEvent::TICK { h, m, s } => {
-                    let mut buf: String<4> = String::new();
-                    buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
+                let is_night = if h > 20 || h < 6 { true } else { false };
 
-                    let is_night = if h > 20 || h < 6 { true } else { false };
-
-                    if !is_night {
-                        *leds = leds.map(|_| RGB8::default());
-                        for i in 0..(s / 4) {
-                            leds[leds_xy_to_n(i as usize, 0)] = RGB8 {
-                                r: 0,
-                                g: LED_LEVEL_DAY + 1,
-                                b: 0,
-                            };
-                        }
-
-                        leds[leds_xy_to_n((s / 4) as usize, 0)] = RGB8 {
+                if !is_night {
+                    *leds = leds.map(|_| RGB8::default());
+                    for i in 0..(s / 4) {
+                        leds[leds_xy_to_n(i as usize, 0)] = RGB8 {
                             r: 0,
-                            g: 1 + (LED_LEVEL_DAY * (s % 4) / 3),
+                            g: LED_LEVEL_DAY + 1,
                             b: 0,
                         };
                     }
 
-                    for (x, mut d) in buf.bytes().enumerate() {
-                        d -= '0' as u8;
-                        leds_draw_digit(
-                            leds,
-                            1 + (4 * x),
-                            2,
-                            d as u8,
-                            RGB8 {
-                                r: if is_night {
-                                    LED_LEVEL_NIGHT
-                                } else {
-                                    LED_LEVEL_DAY
-                                },
-                                g: 0,
-                                b: 0,
+                    leds[leds_xy_to_n((s / 4) as usize, 0)] = RGB8 {
+                        r: 0,
+                        g: 1 + (LED_LEVEL_DAY * (s % 4) / 3),
+                        b: 0,
+                    };
+                }
+
+                for (x, mut d) in buf.bytes().enumerate() {
+                    d -= '0' as u8;
+                    leds_draw_digit(
+                        leds,
+                        1 + (4 * x),
+                        2,
+                        d as u8,
+                        RGB8 {
+                            r: if is_night {
+                                LED_LEVEL_NIGHT
+                            } else {
+                                LED_LEVEL_DAY
                             },
-                        );
-                    }
-                    leds_write(ws, leds);
+                            g: 0,
+                            b: 0,
+                        },
+                    );
                 }
-            },
-            LightState::SUNRISE { prev_val } => match ev {
-                LightEvent::TICK { h: _, m: _, s: _ } => {
-                    defmt::debug!("tick");
-
-                    let v;
-                    if let Some(ramp) = ramp {
-                        loop {
-                            match ramp.next() {
-                                Some((cx, cy)) => match ramp.peek() {
-                                    Some((nx, _)) => {
-                                        if cx != *nx {
-                                            v = Some(cy);
-                                            break;
-                                        } else {
-                                            continue;
-                                        }
-                                    }
-                                    None => {
-                                        v = Some(cy);
-                                        break;
-                                    }
-                                },
-                                None => {
-                                    v = None;
-                                    break;
-                                }
-                            }
-                        }
-
-                        match v {
-                            Some(y) => {
-                                if let Some(y) = match prev_val {
-                                    None => Some(y),
-                                    Some(v) => {
-                                        if *v == y {
-                                            None
-                                        } else {
-                                            Some(y)
-                                        }
-                                    }
-                                } {
-                                    let v: u32 =
-                                        SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()];
-                                    let c = RGB8 {
-                                        b: GAMMA8[(v & 0xFF) as usize],
-                                        g: GAMMA8[((v >> 8) & 0xFF) as usize],
-                                        r: GAMMA8[((v >> 16) & 0xFF) as usize],
-                                    };
-                                    *leds = leds.map(|_| c);
-                                    leds_write(ws, leds);
-                                    *prev_val = Some(y);
-                                }
-                            }
-                            None => {
-                                *leds = leds.map(|_| RGB8::default());
-                                leds_write(ws, leds);
-                                *state = LightState::OFF;
-                            }
-                        }
-                    } else {
-                        defmt::panic!();
-                    }
-                }
-                _ => {
-                    defmt::panic!();
-                }
-            },
+                leds_write(ws, leds);
+            }
+            LightEvent::SOLID_COLOR { color } => {
+                *leds = leds.map(|_| color);
+                leds_write(ws, leds);
+            }
         }
     }
 
@@ -1601,11 +1514,17 @@ mod app {
     }
 
     pub enum MainState {
+        TitleScreen,
         TimeDisplay,
+        Sunrise {
+            ramp: Peekable<Bresenham>,
+            prev_val: Option<isize>,
+        },
     }
 
     #[derive(Debug)]
     pub enum MainEvent {
+        Timeout,
         PPSTick {
             dt: Option<PrimitiveDateTime>,
             gps_lock: bool,
@@ -1613,11 +1532,20 @@ mod app {
         ShortButtonPress,
     }
 
-    #[task(shared = [], local = [state: MainState = MainState::TimeDisplay], priority = 4, capacity = 2)]
+    #[task(shared = [], local = [state: MainState = MainState::TitleScreen], priority = 4, capacity = 2)]
     fn main_sm(cx: main_sm::Context, ev: MainEvent) {
         let state = cx.local.state;
 
         match state {
+            MainState::TitleScreen => match ev {
+                MainEvent::PPSTick { .. } => {
+                    buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+                }
+                MainEvent::Timeout => {
+                    *state = MainState::TimeDisplay;
+                }
+                _ => (),
+            },
             MainState::TimeDisplay => match ev {
                 MainEvent::PPSTick { dt, gps_lock } => {
                     if let Some(dt) = dt {
@@ -1657,18 +1585,92 @@ mod app {
 
                         if ![Weekday::Saturday, Weekday::Sunday].contains(&dt.date().weekday()) {
                             if dt.time() == (ALARM_TIME - SUNRISE_LEN) {
-                                light::spawn(LightEvent::SUNRISE_START).unwrap();
-                            }
-                            if dt.time() == ALARM_TIME {
-                                buzzer::spawn(BuzzerEvent::Alarm).unwrap();
+                                defmt::info!("Starting sunrise");
+
+                                *state = MainState::Sunrise {
+                                    ramp: Bresenham::new(
+                                        (0, 0),
+                                        (
+                                            SUNRISE_LEN.whole_seconds().try_into().unwrap(),
+                                            SUNRISE_CMAP.len().try_into().unwrap(),
+                                        ),
+                                    )
+                                    .peekable(),
+                                    prev_val: None,
+                                };
+
+                                main_sm::spawn(ev).unwrap();
                             }
                         }
 
                         let (h, m, s) = dt.time().as_hms();
                         light::spawn(LightEvent::TICK { h, m, s }).unwrap();
+                    } else {
+                        buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
                     }
                 }
                 _ => defmt::panic!(),
+            },
+            MainState::Sunrise { ramp, prev_val } => match ev {
+                MainEvent::PPSTick { .. } => {
+                    let v;
+                    loop {
+                        match ramp.next() {
+                            Some((cx, cy)) => match ramp.peek() {
+                                Some((nx, _)) => {
+                                    if cx != *nx {
+                                        v = Some(cy);
+                                        break;
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                None => {
+                                    v = Some(cy);
+                                    break;
+                                }
+                            },
+                            None => {
+                                v = None;
+                                break;
+                            }
+                        }
+                    }
+
+                    match v {
+                        Some(y) => {
+                            if let Some(y) = match prev_val {
+                                None => Some(y),
+                                Some(v) => {
+                                    if *v == y {
+                                        None
+                                    } else {
+                                        Some(y)
+                                    }
+                                }
+                            } {
+                                let v: u32 = SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()];
+                                let c = RGB8 {
+                                    b: GAMMA8[(v & 0xFF) as usize],
+                                    g: GAMMA8[((v >> 8) & 0xFF) as usize],
+                                    r: GAMMA8[((v >> 16) & 0xFF) as usize],
+                                };
+                                light::spawn(LightEvent::SOLID_COLOR { color: c }).unwrap();
+                                *prev_val = Some(y);
+                            }
+                        }
+                        None => {
+                            light::spawn(LightEvent::SOLID_COLOR {
+                                color: RGB8::default(),
+                            })
+                            .unwrap();
+
+                            buzzer::spawn(BuzzerEvent::Alarm).unwrap();
+                            *state = MainState::TimeDisplay;
+                        }
+                    }
+                }
+                _ => (),
             },
         }
     }
