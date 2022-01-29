@@ -52,7 +52,7 @@ mod app {
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
     use ws2812::Ws2812;
-    use ws2812_spi::prerendered as ws2812;
+    use ws2812_spi as ws2812;
 
     struct HemisphereWrapper(Hemisphere);
     impl Format for HemisphereWrapper {
@@ -209,8 +209,7 @@ mod app {
         exti: EXTI,
     }
 
-    type Leds = ws2812_spi::prerendered::Ws2812<
-        'static,
+    type Leds = ws2812_spi::Ws2812<
         Spi<
             stm32f1xx_hal::pac::SPI2,
             Spi2NoRemap,
@@ -325,7 +324,7 @@ mod app {
             NoMiso,
             gpiob.pb15.into_alternate_push_pull(&mut gpiob.crh),
         );
-        let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3500.khz(), clocks);
+        let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3000.khz(), clocks);
         let mut leds = [RGB8::default(); NUM_LEDS];
 
         for x in 0..16 {
@@ -338,8 +337,7 @@ mod app {
             }
         }
 
-        static mut DATA: [u8; 12 * NUM_LEDS + 20] = [0; 12 * NUM_LEDS + 20];
-        let mut ws = unsafe { Ws2812::new(spi, &mut DATA) };
+        let mut ws = Ws2812::new(spi);
         ws.write(leds.iter().cloned()).unwrap();
 
         let mut dcb = c.core.DCB;
@@ -693,7 +691,7 @@ mod app {
         }
     }
 
-    #[task(shared = [], local = [ws, leds], priority = 4, capacity = 2)]
+    #[task(shared = [], local = [ws, leds], priority = 16, capacity = 2)]
     fn light(cx: light::Context, ev: LightEvent) {
         let ws = cx.local.ws;
         let leds = cx.local.leds;
