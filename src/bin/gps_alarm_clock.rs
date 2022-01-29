@@ -27,7 +27,10 @@ mod app {
     };
     use profont::{PROFONT_18_POINT, PROFONT_9_POINT};
     use rtic::Monotonic;
-    use smart_leds::{SmartLedsWrite, RGB, RGB8};
+    use smart_leds::{
+        hsv::{hsv2rgb, Hsv},
+        SmartLedsWrite, RGB, RGB8,
+    };
     use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
     use stm32f103_rtic_playground as _;
     use stm32f1xx_hal::gpio::{
@@ -110,7 +113,7 @@ mod app {
     #[monotonic(binds = SysTick, default = true)]
     type MyMono = DwtSystick<FREQ>;
 
-    const BUFF_SIZE: usize = 1024;
+    const BUFF_SIZE: usize = 512;
     const NUM_LEDS: usize = 128;
     const UTC_OFFSET: Duration = Duration::HOUR;
     const ALARM_TIME: Time = time!(6:00:00);
@@ -323,7 +326,17 @@ mod app {
             gpiob.pb15.into_alternate_push_pull(&mut gpiob.crh),
         );
         let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3500.khz(), clocks);
-        let leds = [RGB8::default(); NUM_LEDS];
+        let mut leds = [RGB8::default(); NUM_LEDS];
+
+        for x in 0..16 {
+            for y in 0..8 {
+                leds[leds_xy_to_n(x, y)] = hsv2rgb(Hsv {
+                    hue: (x * 255 / 16).try_into().unwrap(),
+                    sat: 255,
+                    val: 3,
+                });
+            }
+        }
 
         static mut DATA: [u8; 12 * NUM_LEDS + 20] = [0; 12 * NUM_LEDS + 20];
         let mut ws = unsafe { Ws2812::new(spi, &mut DATA) };
@@ -920,8 +933,7 @@ mod app {
         QuarterChime,
         SecondTick,
         Next,
-        Alarm,
-        Button,
+        Alarm { i: Option<usize> },
     }
 
     const ALARMS: &'static [&'static [(u16, u16)]] = &[
@@ -1225,8 +1237,7 @@ mod app {
 
     #[task(local = [buzz_pwm,
                     state: BuzzerState = BuzzerState::Chime {is_on: false, chime: None},
-                    handle: Option<buzzer::SpawnHandle> = None,
-                    curr_al: usize = 0],
+                    handle: Option<buzzer::SpawnHandle> = None],
            shared = [],
            priority = 2,
            capacity = 2)]
@@ -1237,19 +1248,20 @@ mod app {
 
         let buzzer = cx.local.buzz_pwm;
         let s = cx.local.state;
-        let curr_al = cx.local.curr_al;
         let handle = cx.local.handle;
 
         match s {
             BuzzerState::Chime { is_on, chime } => match ev {
-                BuzzerEvent::Alarm => {
-                    *s = BuzzerState::Alarm {
-                        is_pause: false,
-                        dur: 0,
-                        alarm: ALARMS[*curr_al].iter(),
-                        iter: ALARMS[*curr_al].iter(),
-                    };
-                    buzzer::spawn(BuzzerEvent::Next).unwrap();
+                BuzzerEvent::Alarm { i } => {
+                    if let Some(i) = i {
+                        *s = BuzzerState::Alarm {
+                            is_pause: false,
+                            dur: 0,
+                            alarm: ALARMS[i].iter(),
+                            iter: ALARMS[i].iter(),
+                        };
+                        buzzer::spawn(BuzzerEvent::Next).unwrap();
+                    }
                 }
                 _ => {
                     match ev {
@@ -1257,15 +1269,7 @@ mod app {
                         BuzzerEvent::QuarterChime => *chime = Some(QUARTER_CHIME.iter()),
                         BuzzerEvent::SecondTick => *chime = Some(SECOND_TICK.iter()),
                         BuzzerEvent::Next => (),
-                        BuzzerEvent::Button => {
-                            *curr_al += 1;
-                            if *curr_al >= ALARMS.len() {
-                                *curr_al = 0;
-                            }
-                            buzzer::spawn(BuzzerEvent::Alarm).unwrap();
-                            return ();
-                        }
-                        BuzzerEvent::Alarm => {
+                        BuzzerEvent::Alarm { .. } => {
                             defmt::panic!();
                         }
                     }
@@ -1331,15 +1335,28 @@ mod app {
                         }
                     }
                 }
-                BuzzerEvent::Button => {
-                    buzzer.disable(Channel::C1);
-                    if let Some(handle) = handle.take() {
-                        handle.cancel().ok();
+                BuzzerEvent::Alarm { i } => {
+                    if let Some(i) = i {
+                        *s = BuzzerState::Alarm {
+                            is_pause: false,
+                            dur: 0,
+                            alarm: ALARMS[i].iter(),
+                            iter: ALARMS[i].iter(),
+                        };
+                        if let Some(handle) = handle.take() {
+                            handle.cancel().ok();
+                        }
+                        buzzer::spawn(BuzzerEvent::Next).unwrap();
+                    } else {
+                        buzzer.disable(Channel::C1);
+                        if let Some(handle) = handle.take() {
+                            handle.cancel().ok();
+                        }
+                        *s = BuzzerState::Chime {
+                            is_on: false,
+                            chime: None,
+                        };
                     }
-                    *s = BuzzerState::Chime {
-                        is_on: false,
-                        chime: None,
-                    };
                 }
                 _ => {}
             },
@@ -1491,6 +1508,7 @@ mod app {
                     *handle = btn_detector::spawn_after(750.millis(), ButtonEvent::Timeout).ok();
                     *state = ButtonState::ShortPressWait;
                 }
+                ButtonEvent::Depressed => {}
                 _ => defmt::panic!(),
             },
             ButtonState::ShortPressWait => match ev {
@@ -1499,11 +1517,12 @@ mod app {
                     if let Some(handle) = handle.take() {
                         handle.cancel().ok();
                     }
-                    buzzer::spawn(BuzzerEvent::Button).ok();
+                    main_sm::spawn(MainEvent::ShortButtonPress).unwrap();
                     *state = ButtonState::Idle;
                 }
                 ButtonEvent::Timeout => {
                     // we have a long press
+                    main_sm::spawn(MainEvent::LongButtonPress).unwrap();
                     *state = ButtonState::Idle;
                 }
                 _ => {
@@ -1520,6 +1539,7 @@ mod app {
             ramp: Peekable<Bresenham>,
             prev_val: Option<isize>,
         },
+        AlarmSetting,
     }
 
     #[derive(Debug)]
@@ -1530,9 +1550,51 @@ mod app {
             gps_lock: bool,
         },
         ShortButtonPress,
+        LongButtonPress,
     }
 
-    #[task(shared = [], local = [state: MainState = MainState::TitleScreen], priority = 4, capacity = 2)]
+    fn pps_tick_handler(dt: Option<PrimitiveDateTime>, gps_lock: bool) {
+        if let Some(dt) = dt {
+            display::spawn(DispEvent::UPDATE {
+                dt: dt,
+                gps: gps_lock,
+            })
+            .unwrap();
+
+            let (h, s) = (dt.time().hour(), dt.time().second());
+            if h < 22 && h > 7 {
+                match dt.time().minute() {
+                    0 => {
+                        if s == 0 {
+                            buzzer::spawn(BuzzerEvent::HourChime).unwrap();
+                        } else {
+                            buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+                        }
+                    }
+                    59 => {
+                        if s > 56 {
+                            buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
+                        } else {
+                            buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+                        }
+                    }
+                    15 | 30 | 45 => {
+                        if s == 0 {
+                            buzzer::spawn(BuzzerEvent::QuarterChime).unwrap()
+                        } else {
+                            buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+                        }
+                    }
+                    _ => buzzer::spawn(BuzzerEvent::SecondTick).unwrap(),
+                }
+            }
+        } else {
+            buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+        }
+    }
+
+    #[task(shared = [], local = [curr_al: usize = 0, state: MainState = MainState::TitleScreen],
+                        priority = 4, capacity = 4)]
     fn main_sm(cx: main_sm::Context, ev: MainEvent) {
         let state = cx.local.state;
 
@@ -1548,41 +1610,8 @@ mod app {
             },
             MainState::TimeDisplay => match ev {
                 MainEvent::PPSTick { dt, gps_lock } => {
+                    pps_tick_handler(dt, gps_lock);
                     if let Some(dt) = dt {
-                        display::spawn(DispEvent::UPDATE {
-                            dt: dt,
-                            gps: gps_lock,
-                        })
-                        .unwrap();
-
-                        let (h, s) = (dt.time().hour(), dt.time().second());
-                        if h < 22 && h > 7 {
-                            match dt.time().minute() {
-                                0 => {
-                                    if s == 0 {
-                                        buzzer::spawn(BuzzerEvent::HourChime).unwrap();
-                                    } else {
-                                        buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
-                                    }
-                                }
-                                59 => {
-                                    if s > 56 {
-                                        buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
-                                    } else {
-                                        buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
-                                    }
-                                }
-                                15 | 30 | 45 => {
-                                    if s == 0 {
-                                        buzzer::spawn(BuzzerEvent::QuarterChime).unwrap()
-                                    } else {
-                                        buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
-                                    }
-                                }
-                                _ => buzzer::spawn(BuzzerEvent::SecondTick).unwrap(),
-                            }
-                        }
-
                         if ![Weekday::Saturday, Weekday::Sunday].contains(&dt.date().weekday()) {
                             if dt.time() == (ALARM_TIME - SUNRISE_LEN) {
                                 defmt::info!("Starting sunrise");
@@ -1605,14 +1634,23 @@ mod app {
 
                         let (h, m, s) = dt.time().as_hms();
                         light::spawn(LightEvent::TICK { h, m, s }).unwrap();
-                    } else {
-                        buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
                     }
                 }
-                _ => defmt::panic!(),
+                MainEvent::LongButtonPress => {
+                    let (h, m, s) = ALARM_TIME.as_hms();
+                    light::spawn(LightEvent::TICK { h, m, s }).unwrap();
+
+                    buzzer::spawn(BuzzerEvent::Alarm {
+                        i: Some(*cx.local.curr_al),
+                    })
+                    .unwrap();
+                    *state = MainState::AlarmSetting;
+                }
+                _ => (),
             },
             MainState::Sunrise { ramp, prev_val } => match ev {
-                MainEvent::PPSTick { .. } => {
+                MainEvent::PPSTick { dt, gps_lock } => {
+                    pps_tick_handler(dt, gps_lock);
                     let v;
                     loop {
                         match ramp.next() {
@@ -1665,10 +1703,36 @@ mod app {
                             })
                             .unwrap();
 
-                            buzzer::spawn(BuzzerEvent::Alarm).unwrap();
+                            buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
                             *state = MainState::TimeDisplay;
                         }
                     }
+                }
+                _ => (),
+            },
+            MainState::AlarmSetting => match ev {
+                MainEvent::PPSTick { dt, gps_lock } => {
+                    if let Some(dt) = dt {
+                        display::spawn(DispEvent::UPDATE {
+                            dt: dt,
+                            gps: gps_lock,
+                        })
+                        .unwrap()
+                    }
+                }
+                MainEvent::LongButtonPress => {
+                    *state = MainState::TimeDisplay;
+                    buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
+                }
+                MainEvent::ShortButtonPress => {
+                    *cx.local.curr_al += 1;
+                    if *cx.local.curr_al >= ALARMS.len() {
+                        *cx.local.curr_al = 0;
+                    }
+                    buzzer::spawn(BuzzerEvent::Alarm {
+                        i: Some(*cx.local.curr_al),
+                    })
+                    .unwrap();
                 }
                 _ => (),
             },
