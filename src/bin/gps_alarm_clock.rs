@@ -20,7 +20,7 @@ mod app {
         text::{Baseline, Text},
     };
     use embedded_hal::digital::v2::{InputPin, OutputPin};
-    use heapless::String;
+    use heapless::{String, Vec};
     use nmea0183::{
         coords::{Hemisphere, Latitude, Longitude},
         ParseResult, Parser, Sentence,
@@ -701,23 +701,16 @@ mod app {
                 let mut buf: String<4> = String::new();
                 buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
 
+                *leds = leds.map(|_| RGB8::default());
                 let is_night = if h > 20 || h < 6 { true } else { false };
 
                 if !is_night {
-                    *leds = leds.map(|_| RGB8::default());
                     for i in 0..(s / 4) {
-                        leds[leds_xy_to_n(i as usize, 0)] = RGB8 {
-                            r: 0,
-                            g: LED_LEVEL_DAY + 1,
-                            b: 0,
-                        };
+                        leds[leds_xy_to_n(i as usize, 0)] = RGB8::new(0, LED_LEVEL_DAY + 1, 0);
                     }
 
-                    leds[leds_xy_to_n((s / 4) as usize, 0)] = RGB8 {
-                        r: 0,
-                        g: 1 + (LED_LEVEL_DAY * (s % 4) / 3),
-                        b: 0,
-                    };
+                    leds[leds_xy_to_n((s / 4) as usize, 0)] =
+                        RGB8::new(0, 1 + (LED_LEVEL_DAY * (s % 4) / 3), 0);
                 }
 
                 for (x, mut d) in buf.bytes().enumerate() {
@@ -727,15 +720,15 @@ mod app {
                         1 + (4 * x),
                         2,
                         d as u8,
-                        RGB8 {
-                            r: if is_night {
+                        RGB8::new(
+                            if is_night {
                                 LED_LEVEL_NIGHT
                             } else {
                                 LED_LEVEL_DAY
                             },
-                            g: 0,
-                            b: 0,
-                        },
+                            0,
+                            0,
+                        ),
                     );
                 }
                 leds_write(ws, leds);
@@ -1252,6 +1245,9 @@ mod app {
             BuzzerState::Chime { is_on, chime } => match ev {
                 BuzzerEvent::Alarm { i } => {
                     if let Some(i) = i {
+                        if let Some(handle) = handle.take() {
+                            handle.cancel().ok();
+                        }
                         *s = BuzzerState::Alarm {
                             is_pause: false,
                             dur: 0,
@@ -1288,7 +1284,8 @@ mod app {
                                     buzzer.enable(Channel::C1);
                                     *is_on = true;
                                 }
-                                buzzer::spawn_after(delay.millis(), BuzzerEvent::Next).unwrap();
+                                *handle =
+                                    buzzer::spawn_after(delay.millis(), BuzzerEvent::Next).ok();
                             }
                         }
                     }
@@ -1304,8 +1301,9 @@ mod app {
                     if *is_pause {
                         *is_pause = false;
                         buzzer.disable(Channel::C1);
-                        buzzer::spawn_after(((*dur / 10) as u32).millis(), BuzzerEvent::Next)
-                            .unwrap();
+                        *handle =
+                            buzzer::spawn_after(((*dur / 10) as u32).millis(), BuzzerEvent::Next)
+                                .ok();
                     } else {
                         match alarm.next() {
                             Some((freq, dur_)) => {
@@ -1537,6 +1535,7 @@ mod app {
             ramp: Peekable<Bresenham>,
             prev_val: Option<isize>,
         },
+        Alarm,
         AlarmSetting,
     }
 
@@ -1557,7 +1556,7 @@ mod app {
                 dt: dt,
                 gps: gps_lock,
             })
-            .unwrap();
+            .ok();
 
             let (h, s) = (dt.time().hour(), dt.time().second());
             if h < 22 && h > 7 {
@@ -1685,28 +1684,42 @@ mod app {
                                     }
                                 }
                             } {
-                                let v: u32 = SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()];
-                                let c = RGB8 {
-                                    b: GAMMA8[(v & 0xFF) as usize],
-                                    g: GAMMA8[((v >> 8) & 0xFF) as usize],
-                                    r: GAMMA8[((v >> 16) & 0xFF) as usize],
-                                };
+                                let rgb = SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()]
+                                    .to_be_bytes()[1..4]
+                                    .iter()
+                                    .map(|v| GAMMA8[*v as usize])
+                                    .collect::<Vec<_, 3>>();
+                                let c = RGB8::new(rgb[0], rgb[1], rgb[2]);
                                 light::spawn(LightEvent::SOLID_COLOR { color: c }).unwrap();
                                 *prev_val = Some(y);
                             }
                         }
                         None => {
-                            light::spawn(LightEvent::SOLID_COLOR {
-                                color: RGB8::default(),
+                            buzzer::spawn(BuzzerEvent::Alarm {
+                                i: Some(*cx.local.curr_al),
                             })
                             .unwrap();
-
-                            buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
-                            *state = MainState::TimeDisplay;
+                            *state = MainState::Alarm;
                         }
                     }
                 }
                 _ => (),
+            },
+            MainState::Alarm => match ev {
+                MainEvent::PPSTick { dt, gps_lock } => {
+                    if let Some(dt) = dt {
+                        display::spawn(DispEvent::UPDATE {
+                            dt: dt,
+                            gps: gps_lock,
+                        })
+                        .ok();
+                    }
+                }
+                MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
+                    buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
+                    *state = MainState::TimeDisplay;
+                }
+                _ => {}
             },
             MainState::AlarmSetting => match ev {
                 MainEvent::PPSTick { dt, gps_lock } => {
