@@ -5,7 +5,6 @@
 #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true, dispatchers = [PVD, WWDG, RTC, SPI1])]
 mod app {
     use bbqueue::BBBuffer;
-    use bitflags::bitflags;
     use bresenham::Bresenham;
     use core::fmt::{Debug, Write};
     use core::iter::Peekable;
@@ -208,7 +207,6 @@ mod app {
         env_data: Option<(u16, i16)>,
         am_pin: stm32f1xx_hal::gpio::Pin<stm32f1xx_hal::gpio::Dynamic, CRL, 'A', 0_u8>,
         am_reset: bool,
-        buzz_subs: BuzzerEvSubs,
         btn_pin: PA4<Input<PullUp>>,
         exti: EXTI,
     }
@@ -382,7 +380,6 @@ mod app {
                 env_data: None,
                 am_pin,
                 am_reset: true,
-                buzz_subs: BuzzerEvSubs::CHIMES,
                 btn_pin: btn,
                 exti: c.device.EXTI,
             },
@@ -544,7 +541,7 @@ mod app {
         rgr.release(len);
     }
 
-    #[task(binds = EXTI1, shared = [datetime, gps_locked, pps_timeout, eeprom, buzz_subs],
+    #[task(binds = EXTI1, shared = [datetime, gps_locked, pps_timeout, eeprom],
                            local = [pps, dst], priority = 16)]
     fn pps_isr(cx: pps_isr::Context) {
         let pps_isr::SharedResources {
@@ -552,7 +549,6 @@ mod app {
             gps_locked,
             pps_timeout,
             eeprom,
-            mut buzz_subs,
         } = cx.shared;
 
         cx.local.pps.clear_interrupt_pending_bit();
@@ -575,59 +571,13 @@ mod app {
                     if *gps_locked {
                         *pps_timeout = pps_timeout::spawn_after(900.millis()).ok();
                     }
-
-                    if ![Weekday::Saturday, Weekday::Sunday].contains(&dt_.date().weekday()) {
-                        if dt_.time() == (ALARM_TIME - SUNRISE_LEN) {
-                            light::spawn(LightEvent::SUNRISE_START).unwrap();
-                        }
-                    }
-
-                    let (h, m, s) = dt_.time().as_hms();
-                    light::spawn(LightEvent::TICK { h, m, s }).unwrap();
-
-                    if dt_.time() == ALARM_TIME {
-                        buzzer::spawn(BuzzerEvent::Alarm).unwrap();
-                    }
                     (Some(dt_), *gps_locked)
                 } else {
                     (None, *gps_locked)
                 }
             },
         );
-        if let Some(dt) = dt {
-            display::spawn(DispEvent::UPDATE { dt: dt, gps: gps }).unwrap();
-            buzz_subs.lock(|subs| {
-                if !(*subs & BuzzerEvSubs::CHIMES).is_empty() {
-                    let (h, s) = (dt.time().hour(), dt.time().second());
-                    if h < 22 && h > 7 {
-                        match dt.time().minute() {
-                            0 => {
-                                if s == 0 {
-                                    buzzer::spawn(BuzzerEvent::HourChime).unwrap();
-                                } else {
-                                    buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
-                                }
-                            }
-                            59 => {
-                                if s > 56 {
-                                    buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
-                                } else {
-                                    buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
-                                }
-                            }
-                            15 | 30 | 45 => {
-                                if s == 0 {
-                                    buzzer::spawn(BuzzerEvent::QuarterChime).unwrap()
-                                } else {
-                                    buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
-                                }
-                            }
-                            _ => buzzer::spawn(BuzzerEvent::SecondTick).unwrap(),
-                        }
-                    }
-                }
-            })
-        }
+        main_sm::spawn(MainEvent::PPSTick { dt, gps_lock: gps }).unwrap();
         am_sensor::spawn_after(800.millis(), AmSensorEvent::START).unwrap();
     }
 
@@ -763,30 +713,42 @@ mod app {
                     let mut buf: String<4> = String::new();
                     buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
 
-                    let l = if h > 20 || h < 6 {
-                        LED_LEVEL_NIGHT
-                    } else {
-                        LED_LEVEL_DAY
-                    };
+                    let is_night = if h > 20 || h < 6 { true } else { false };
 
-                    *leds = leds.map(|_| RGB8::default());
-                    for i in 0..(s / 4) {
-                        leds[leds_xy_to_n(i as usize, 0)] = RGB8 {
+                    if !is_night {
+                        *leds = leds.map(|_| RGB8::default());
+                        for i in 0..(s / 4) {
+                            leds[leds_xy_to_n(i as usize, 0)] = RGB8 {
+                                r: 0,
+                                g: LED_LEVEL_DAY + 1,
+                                b: 0,
+                            };
+                        }
+
+                        leds[leds_xy_to_n((s / 4) as usize, 0)] = RGB8 {
                             r: 0,
-                            g: l + 1,
+                            g: 1 + (LED_LEVEL_DAY * (s % 4) / 3),
                             b: 0,
                         };
                     }
 
-                    leds[leds_xy_to_n((s / 4) as usize, 0)] = RGB8 {
-                        r: 0,
-                        g: 1 + (l * (s % 4) / 3),
-                        b: 0,
-                    };
-
                     for (x, mut d) in buf.bytes().enumerate() {
                         d -= '0' as u8;
-                        leds_draw_digit(leds, 1 + (4 * x), 2, d as u8, RGB8 { r: l, g: 0, b: 0 });
+                        leds_draw_digit(
+                            leds,
+                            1 + (4 * x),
+                            2,
+                            d as u8,
+                            RGB8 {
+                                r: if is_night {
+                                    LED_LEVEL_NIGHT
+                                } else {
+                                    LED_LEVEL_DAY
+                                },
+                                g: 0,
+                                b: 0,
+                            },
+                        );
                     }
                     leds_write(ws, leds);
                 }
@@ -1047,13 +1009,6 @@ mod app {
         Next,
         Alarm,
         Button,
-    }
-
-    bitflags! {
-        pub struct BuzzerEvSubs: u8 {
-            const CHIMES = 0b00000001;
-            const ALARM = 0b00000010;
-        }
     }
 
     const ALARMS: &'static [&'static [(u16, u16)]] = &[
@@ -1359,7 +1314,7 @@ mod app {
                     state: BuzzerState = BuzzerState::Chime {is_on: false, chime: None},
                     handle: Option<buzzer::SpawnHandle> = None,
                     curr_al: usize = 0],
-           shared = [buzz_subs],
+           shared = [],
            priority = 2,
            capacity = 2)]
     fn buzzer(cx: buzzer::Context, ev: BuzzerEvent) {
@@ -1369,16 +1324,12 @@ mod app {
 
         let buzzer = cx.local.buzz_pwm;
         let s = cx.local.state;
-        let mut buzz_subs = cx.shared.buzz_subs;
         let curr_al = cx.local.curr_al;
         let handle = cx.local.handle;
 
         match s {
             BuzzerState::Chime { is_on, chime } => match ev {
                 BuzzerEvent::Alarm => {
-                    buzz_subs.lock(|subs| {
-                        *subs = BuzzerEvSubs::ALARM;
-                    });
                     *s = BuzzerState::Alarm {
                         is_pause: false,
                         dur: 0,
@@ -1468,9 +1419,6 @@ mod app {
                     }
                 }
                 BuzzerEvent::Button => {
-                    buzz_subs.lock(|subs| {
-                        *subs = BuzzerEvSubs::CHIMES;
-                    });
                     buzzer.disable(Channel::C1);
                     if let Some(handle) = handle.take() {
                         handle.cancel().ok();
@@ -1648,6 +1596,79 @@ mod app {
                 _ => {
                     defmt::panic!();
                 }
+            },
+        }
+    }
+
+    pub enum MainState {
+        TimeDisplay,
+    }
+
+    #[derive(Debug)]
+    pub enum MainEvent {
+        PPSTick {
+            dt: Option<PrimitiveDateTime>,
+            gps_lock: bool,
+        },
+        ShortButtonPress,
+    }
+
+    #[task(shared = [], local = [state: MainState = MainState::TimeDisplay], priority = 4, capacity = 2)]
+    fn main_sm(cx: main_sm::Context, ev: MainEvent) {
+        let state = cx.local.state;
+
+        match state {
+            MainState::TimeDisplay => match ev {
+                MainEvent::PPSTick { dt, gps_lock } => {
+                    if let Some(dt) = dt {
+                        display::spawn(DispEvent::UPDATE {
+                            dt: dt,
+                            gps: gps_lock,
+                        })
+                        .unwrap();
+
+                        let (h, s) = (dt.time().hour(), dt.time().second());
+                        if h < 22 && h > 7 {
+                            match dt.time().minute() {
+                                0 => {
+                                    if s == 0 {
+                                        buzzer::spawn(BuzzerEvent::HourChime).unwrap();
+                                    } else {
+                                        buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+                                    }
+                                }
+                                59 => {
+                                    if s > 56 {
+                                        buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
+                                    } else {
+                                        buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+                                    }
+                                }
+                                15 | 30 | 45 => {
+                                    if s == 0 {
+                                        buzzer::spawn(BuzzerEvent::QuarterChime).unwrap()
+                                    } else {
+                                        buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
+                                    }
+                                }
+                                _ => buzzer::spawn(BuzzerEvent::SecondTick).unwrap(),
+                            }
+                        }
+
+                        if ![Weekday::Saturday, Weekday::Sunday].contains(&dt.date().weekday()) {
+                            if dt.time() == (ALARM_TIME - SUNRISE_LEN) {
+                                light::spawn(LightEvent::SUNRISE_START).unwrap();
+                            }
+                            if dt.time() == ALARM_TIME {
+                                buzzer::spawn(BuzzerEvent::Alarm).unwrap();
+                            }
+                        }
+
+                        let (h, m, s) = dt.time().as_hms();
+                        light::spawn(LightEvent::TICK { h, m, s }).unwrap();
+                    }
+                }
+                _ => defmt::panic!(),
             },
         }
     }
