@@ -1565,6 +1565,18 @@ mod app {
         }
     }
 
+    #[derive(Debug, PartialEq, Format)]
+    pub enum ButtonEvent {
+        Depressed,
+        Pressed,
+        Timeout,
+    }
+
+    pub enum ButtonState {
+        Idle,
+        ShortPressWait,
+    }
+
     #[task(binds = EXTI4, shared = [btn_pin, exti],
         local = [], priority = 2)]
     fn button_isr(cx: button_isr::Context) {
@@ -1578,19 +1590,66 @@ mod app {
         });
     }
 
-    #[task(local = [],
+    #[task(local = [is_pressed: bool = false],
         shared = [btn_pin, exti],
         priority = 2)]
     fn btn_debouncer(cx: btn_debouncer::Context) {
         let btn = cx.shared.btn_pin;
         let exti = cx.shared.exti;
+        let is_pressed = cx.local.is_pressed;
 
         (btn, exti).lock(|btn, exti| {
-            if btn.is_low() {
-                buzzer::spawn(BuzzerEvent::Button).ok();
+            if *is_pressed {
+                if btn.is_high() {
+                    btn.trigger_on_edge(exti, Edge::Falling);
+                    *is_pressed = false;
+                    btn_detector::spawn(ButtonEvent::Depressed).unwrap();
+                }
+            } else {
+                if btn.is_low() {
+                    btn.trigger_on_edge(exti, Edge::Rising);
+                    *is_pressed = true;
+                    btn_detector::spawn(ButtonEvent::Pressed).unwrap();
+                }
             }
             btn.enable_interrupt(exti);
         });
+    }
+
+    #[task(local = [state: ButtonState = ButtonState::Idle,
+                    handle: Option<btn_detector::SpawnHandle> = None],
+        capacity = 2,
+        priority = 2)]
+    fn btn_detector(cx: btn_detector::Context, ev: ButtonEvent) {
+        let state = cx.local.state;
+        let handle = cx.local.handle;
+
+        match state {
+            ButtonState::Idle => match ev {
+                ButtonEvent::Pressed => {
+                    *handle = btn_detector::spawn_after(750.millis(), ButtonEvent::Timeout).ok();
+                    *state = ButtonState::ShortPressWait;
+                }
+                _ => defmt::panic!(),
+            },
+            ButtonState::ShortPressWait => match ev {
+                ButtonEvent::Depressed => {
+                    // we have a short press
+                    if let Some(handle) = handle.take() {
+                        handle.cancel().ok();
+                    }
+                    buzzer::spawn(BuzzerEvent::Button).ok();
+                    *state = ButtonState::Idle;
+                }
+                ButtonEvent::Timeout => {
+                    // we have a long press
+                    *state = ButtonState::Idle;
+                }
+                _ => {
+                    defmt::panic!();
+                }
+            },
+        }
     }
 
     #[idle(local = [led, wdg])]
