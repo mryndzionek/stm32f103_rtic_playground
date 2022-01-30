@@ -558,34 +558,38 @@ mod app {
             eeprom,
         } = cx.shared;
 
-        cx.local.pps.clear_interrupt_pending_bit();
+        let pps = cx.local.pps;
 
-        defmt::debug!("pps");
-        let (dt, gps) = (datetime, gps_locked, pps_timeout, eeprom).lock(
-            |dt, gps_locked, pps_timeout, eeprom| {
-                if let Some(mut dt_) = *dt {
-                    *dt = Some(dt_ + Duration::SECOND);
-                    dt_ += Duration::SECOND;
-                    // TODO local.offset needs to be saved into persistent memory
-                    let dst_change = dst_adjust(dt_ + UTC_OFFSET + *cx.local.dst);
-                    if dst_change != Duration::ZERO {
-                        *cx.local.dst += dst_change;
-                        eeprom
-                            .write(0, cx.local.dst.whole_hours().try_into().unwrap())
-                            .unwrap();
+        if pps.check_interrupt() {
+            pps.clear_interrupt_pending_bit();
+
+            defmt::debug!("pps");
+            let (dt, gps) = (datetime, gps_locked, pps_timeout, eeprom).lock(
+                |dt, gps_locked, pps_timeout, eeprom| {
+                    if let Some(mut dt_) = *dt {
+                        *dt = Some(dt_ + Duration::SECOND);
+                        dt_ += Duration::SECOND;
+                        // TODO local.offset needs to be saved into persistent memory
+                        let dst_change = dst_adjust(dt_ + UTC_OFFSET + *cx.local.dst);
+                        if dst_change != Duration::ZERO {
+                            *cx.local.dst += dst_change;
+                            eeprom
+                                .write(0, cx.local.dst.whole_hours().try_into().unwrap())
+                                .unwrap();
+                        }
+                        dt_ += UTC_OFFSET + *cx.local.dst;
+                        if *gps_locked {
+                            *pps_timeout = pps_timeout::spawn_after(900.millis()).ok();
+                        }
+                        (Some(dt_), *gps_locked)
+                    } else {
+                        (None, *gps_locked)
                     }
-                    dt_ += UTC_OFFSET + *cx.local.dst;
-                    if *gps_locked {
-                        *pps_timeout = pps_timeout::spawn_after(900.millis()).ok();
-                    }
-                    (Some(dt_), *gps_locked)
-                } else {
-                    (None, *gps_locked)
-                }
-            },
-        );
-        main_sm::spawn(MainEvent::PPSTick { dt, gps_lock: gps }).unwrap();
-        am_sensor::spawn_after(800.millis(), AmSensorEvent::START).unwrap();
+                },
+            );
+            main_sm::spawn(MainEvent::PPSTick { dt, gps_lock: gps }).unwrap();
+            am_sensor::spawn_after(800.millis(), AmSensorEvent::START).unwrap();
+        }
     }
 
     #[task(shared = [gps_locked], local = [], priority = 2)]
@@ -765,43 +769,50 @@ mod app {
         let i = cx.local.i;
         let data = cx.local.data;
 
-        (pin_r, reset_r).lock(|pin, reset| {
-            pin.clear_interrupt_pending_bit();
-            if *reset {
-                *i = 0;
-                *cx.local.last = 0;
-                *reset = false;
+        let pps_int = (pin_r, reset_r).lock(|pin, reset| {
+            let intr = pin.check_interrupt();
+            if intr {
+                pin.clear_interrupt_pending_bit();
+                if *reset {
+                    *i = 0;
+                    *cx.local.last = 0;
+                    *reset = false;
+                }
             }
+            intr
         });
-        *i += 1;
-        let curr = monotonics::now().ticks();
-        let len = (curr - *cx.local.last) / 72;
 
-        if *i > 2 {
-            if (*i % 2) == 1 {
-                if !(len >= 40 && len < 70) {
-                    defmt::warn!("Wrong preamble length");
+        if pps_int {
+            *i += 1;
+            let curr = monotonics::now().ticks();
+            let len = (curr - *cx.local.last) / 72;
+
+            if *i > 2 {
+                if (*i % 2) == 1 {
+                    if !(len >= 40 && len < 70) {
+                        defmt::warn!("Wrong preamble length");
+                    }
+                } else {
+                    let j = (*i - 4) / 2;
+                    let (n, m) = ((j / 8), 7 - (j % 8));
+                    match len {
+                        20..=40 => {
+                            data[n] &= !(1 << m);
+                        }
+                        60..=80 => {
+                            data[n] |= 1 << m;
+                        }
+                        _ => defmt::warn!("Wrong bit length"),
+                    }
                 }
-            } else {
-                let j = (*i - 4) / 2;
-                let (n, m) = ((j / 8), 7 - (j % 8));
-                match len {
-                    20..=40 => {
-                        data[n] &= !(1 << m);
-                    }
-                    60..=80 => {
-                        data[n] |= 1 << m;
-                    }
-                    _ => defmt::warn!("Wrong bit length"),
+                if *i >= 83 {
+                    defmt::debug!("Sensor data: {}", data);
+                    *i = 0;
+                    am_sensor::spawn(AmSensorEvent::DATA { data: data.clone() }).unwrap();
                 }
             }
-            if *i >= 83 {
-                defmt::debug!("Sensor data: {}", data);
-                *i = 0;
-                am_sensor::spawn(AmSensorEvent::DATA { data: data.clone() }).unwrap();
-            }
+            *cx.local.last = curr;
         }
-        *cx.local.last = curr;
     }
 
     #[task(shared = [env_data, am_pin, am_reset, exti], local = [am_crl, am_afio,
