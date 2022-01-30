@@ -123,6 +123,11 @@ mod app {
     const BUZZER_BASE_FREQ_HZ: u32 = 4000;
     const LED_LEVEL_DAY: u8 = 16;
     const LED_LEVEL_NIGHT: u8 = 1;
+    const DEFAULT_LAMP_COLOR: Hsv = Hsv {
+        hue: 0,
+        sat: 255,
+        val: 100,
+    };
 
     const EEPROM_PARAMS: Params = Params {
         first_page: 126,
@@ -634,7 +639,7 @@ mod app {
             .unwrap();
     }
 
-    #[task(shared = [env_data], local = [display, state: DispState = DispState::INIT], priority = 1)]
+    #[task(shared = [env_data], local = [display, state: DispState = DispState::INIT], priority = 2)]
     fn display(cx: display::Context, ev: DispEvent) {
         let d = cx.local.display;
         let s = cx.local.state;
@@ -1255,7 +1260,7 @@ mod app {
                     state: BuzzerState = BuzzerState::Chime {is_on: false, chime: None},
                     handle: Option<buzzer::SpawnHandle> = None],
            shared = [],
-           priority = 2,
+           priority = 4,
            capacity = 2)]
     fn buzzer(cx: buzzer::Context, ev: BuzzerEvent) {
         const HOUR_CHIME: [u32; 3] = [100, 80, 50];
@@ -1562,6 +1567,9 @@ mod app {
         },
         Alarm,
         AlarmSetting,
+        Lamp {
+            hue: u8,
+        },
     }
 
     #[derive(Debug)]
@@ -1760,7 +1768,13 @@ mod app {
                     }
                 }
                 MainEvent::LongButtonPress => {
-                    *state = MainState::TimeDisplay;
+                    *state = MainState::Lamp {
+                        hue: DEFAULT_LAMP_COLOR.hue,
+                    };
+                    light::spawn(LightEvent::SOLID_COLOR {
+                        color: hsv2rgb(DEFAULT_LAMP_COLOR),
+                    })
+                    .unwrap();
                     buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
                 }
                 MainEvent::ShortButtonPress => {
@@ -1773,6 +1787,36 @@ mod app {
                     })
                     .unwrap();
                 }
+                _ => (),
+            },
+            MainState::Lamp { hue } => match ev {
+                MainEvent::PPSTick { dt, gps_lock } => {
+                    pps_tick_handler(dt, gps_lock);
+                }
+                MainEvent::LongButtonPress => {
+                    *state = MainState::TimeDisplay;
+                }
+                MainEvent::Encoder { dir } => match dir {
+                    EncDir::Clockwise => {
+                        *hue += 1;
+                        let mut hsv = DEFAULT_LAMP_COLOR;
+                        hsv.hue = *hue;
+                        light::spawn(LightEvent::SOLID_COLOR {
+                            color: hsv2rgb(hsv),
+                        })
+                        .unwrap();
+                    }
+                    EncDir::CounterClockwise => {
+                        *hue -= 1;
+                        let mut hsv = DEFAULT_LAMP_COLOR;
+                        hsv.hue = *hue;
+                        light::spawn(LightEvent::SOLID_COLOR {
+                            color: hsv2rgb(hsv),
+                        })
+                        .unwrap();
+                    }
+                    _ => (),
+                },
                 _ => (),
             },
         }
