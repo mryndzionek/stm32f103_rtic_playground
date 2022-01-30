@@ -26,6 +26,7 @@ mod app {
         ParseResult, Parser, Sentence,
     };
     use profont::{PROFONT_18_POINT, PROFONT_9_POINT};
+    use rotary_encoder_hal::{Direction as EncDir, Rotary};
     use rtic::Monotonic;
     use smart_leds::{
         hsv::{hsv2rgb, Hsv},
@@ -35,6 +36,7 @@ mod app {
     use stm32f103_rtic_playground as _;
     use stm32f1xx_hal::gpio::{
         gpioa::{PA1, PA4},
+        gpiob::{PB0, PB1},
         gpioc::PC13,
         Alternate, Cr, Edge, ExtiPin, Input, OpenDrain, Output, PullDown, PullUp, PushPull, CRL,
     };
@@ -42,12 +44,12 @@ mod app {
     use stm32f1xx_hal::{
         flash::{FlashSize, Parts, SectorSize},
         i2c::{BlockingI2c, DutyCycle, Mode},
-        pac::{EXTI, I2C1, TIM3},
+        pac::{EXTI, I2C1, TIM2, TIM3},
         prelude::*,
         pwm::{Channel, Pwm, C1},
         serial::{Config, Rx2, Serial},
         spi::{NoMiso, NoSck, Spi, Spi2NoRemap},
-        timer::{Tim3NoRemap, Timer},
+        timer::{CountDownTimer, Event, Tim3NoRemap, Timer},
     };
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
@@ -238,6 +240,8 @@ mod app {
         am_afio: stm32f1xx_hal::afio::Parts,
         buzz_pwm: Pwm<TIM3, Tim3NoRemap, C1, stm32f1xx_hal::gpio::gpioa::PA6<Alternate<PushPull>>>,
         wdg: IndependentWatchdog,
+        enc_timer: CountDownTimer<TIM2>,
+        encoder: Rotary<PB0<Input<PullUp>>, PB1<Input<PullUp>>>,
     }
 
     #[init(local = [flash: Option<Parts> = None])]
@@ -373,6 +377,13 @@ mod app {
         am_pin.set_high().unwrap();
         let am_crl = gpioa.crl;
 
+        let enc_a = gpiob.pb0.into_pull_up_input(&mut gpiob.crl);
+        let enc_b = gpiob.pb1.into_pull_up_input(&mut gpiob.crl);
+        let encoder = Rotary::new(enc_a, enc_b);
+
+        let mut enc_timer = Timer::tim2(c.device.TIM2, &clocks).start_count_down(1000.hz());
+        enc_timer.listen(Event::Update);
+
         let wdg = IndependentWatchdog::new(c.device.IWDG);
 
         display::spawn_after(50.millis(), DispEvent::INIT).unwrap();
@@ -405,6 +416,8 @@ mod app {
                 am_afio: afio,
                 buzz_pwm,
                 wdg,
+                enc_timer,
+                encoder,
             },
             init::Monotonics(mono),
         )
@@ -766,6 +779,7 @@ mod app {
     fn am_data_isr(cx: am_data_isr::Context) {
         let pin_r = cx.shared.am_pin;
         let reset_r = cx.shared.am_reset;
+
         let i = cx.local.i;
         let data = cx.local.data;
 
@@ -1559,6 +1573,9 @@ mod app {
         },
         ShortButtonPress,
         LongButtonPress,
+        Encoder {
+            dir: EncDir,
+        },
     }
 
     fn pps_tick_handler(dt: Option<PrimitiveDateTime>, gps_lock: bool) {
@@ -1759,6 +1776,34 @@ mod app {
                 _ => (),
             },
         }
+    }
+
+    #[task(binds = TIM2, local = [enc_timer, encoder, pos: isize = 0],
+           priority = 2)]
+    fn enc_timer(cx: enc_timer::Context) {
+        let timer = cx.local.enc_timer;
+        let encoder = cx.local.encoder;
+        let pos = cx.local.pos;
+
+        match encoder.update().unwrap() {
+            EncDir::Clockwise => {
+                *pos += 1;
+                main_sm::spawn(MainEvent::Encoder {
+                    dir: EncDir::Clockwise,
+                })
+                .unwrap();
+            }
+            EncDir::CounterClockwise => {
+                *pos -= 1;
+                main_sm::spawn(MainEvent::Encoder {
+                    dir: EncDir::CounterClockwise,
+                })
+                .unwrap();
+            }
+            EncDir::None => {}
+        }
+
+        timer.clear_update_interrupt_flag();
     }
 
     #[idle(local = [led, wdg])]

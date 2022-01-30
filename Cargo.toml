@@ -31,6 +31,7 @@ ssd1306 = "0.7"
 smart-leds = "0.3.0"
 ws2812-spi = { version = "0.4" }
 eeprom = { version = "0.2.0" , features = ["stm32f103"] }
+rotary-encoder-hal = "0.5.0"
 
 bbqueue = "0.5.1"
 nmea0183 = "0.3.0"
