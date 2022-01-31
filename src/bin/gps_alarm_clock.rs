@@ -318,10 +318,10 @@ mod app {
                 duty_cycle: DutyCycle::Ratio2to1,
             },
             clocks,
-            1000,
+            10000,
             10,
-            1000,
-            1000,
+            10000,
+            10000,
         );
 
         let interface = I2CDisplayInterface::new(i2c);
@@ -724,7 +724,7 @@ mod app {
                 buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
 
                 *leds = leds.map(|_| RGB8::default());
-                let is_night = if h > 20 || h < 6 { true } else { false };
+                let is_night = if h > 20 || h < 7 { true } else { false };
 
                 if !is_night {
                     for i in 0..(s / 4) {
@@ -1405,7 +1405,7 @@ mod app {
 
                                        [0b111,
                                         0b001,
-                                        0b111,
+                                        0b011,
                                         0b100,
                                         0b111],
 
@@ -1423,18 +1423,18 @@ mod app {
 
                                        [0b111,
                                         0b100,
-                                        0b111,
+                                        0b110,
                                         0b001,
                                         0b111],
 
-                                       [0b111,
+                                       [0b011,
                                         0b100,
                                         0b111,
                                         0b101,
                                         0b111],
 
                                        [0b111,
-                                        0b101,
+                                        0b001,
                                         0b001,
                                         0b001,
                                         0b001],
@@ -1449,7 +1449,7 @@ mod app {
                                         0b101,
                                         0b111,
                                         0b001,
-                                        0b111],
+                                        0b110],
                                         ];
 
     fn leds_xy_to_n(x: usize, y: usize) -> usize {
@@ -1725,7 +1725,7 @@ mod app {
                                     .iter()
                                     .map(|v| GAMMA8[*v as usize])
                                     .collect::<Vec<_, 3>>();
-                                let c = RGB8::new(rgb[0], rgb[1], rgb[2]);
+                                let c = RGB8::new(rgb[0], rgb[1], rgb[2]) / 6;
                                 light::spawn(LightEvent::SOLID_COLOR { color: c }).unwrap();
                                 *prev_val = Some(y);
                             }
@@ -1738,6 +1738,9 @@ mod app {
                             *state = MainState::Alarm;
                         }
                     }
+                }
+                MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
+                    *state = MainState::TimeDisplay;
                 }
                 _ => (),
             },
