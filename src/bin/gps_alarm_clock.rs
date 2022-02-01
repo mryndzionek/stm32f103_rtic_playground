@@ -25,7 +25,9 @@ mod app {
         coords::{Hemisphere, Latitude, Longitude},
         ParseResult, Parser, Sentence,
     };
+    use oorandom::Rand32;
     use profont::{PROFONT_18_POINT, PROFONT_9_POINT};
+    use rgb::AsPixels;
     use rotary_encoder_hal::{Direction as EncDir, Rotary};
     use rtic::Monotonic;
     use smart_leds::{
@@ -116,11 +118,13 @@ mod app {
     type MyMono = DwtSystick<FREQ>;
 
     const BUFF_SIZE: usize = 512;
-    const NUM_LEDS: usize = 128;
+    const LED_ROWS: usize = 8;
+    const LED_COLS: usize = 16;
+    const NUM_LEDS: usize = LED_COLS * LED_ROWS;
     const UTC_OFFSET: Duration = Duration::HOUR;
     const ALARM_TIME: Time = time!(6:00:00);
     const SUNRISE_LEN: Duration = Duration::minutes(30);
-    const BUZZER_BASE_FREQ_HZ: u32 = 4000;
+    const BUZZER_BASE_FREQ_HZ: u32 = 6000;
     const LED_LEVEL_DAY: u8 = 16;
     const LED_LEVEL_NIGHT: u8 = 1;
     const DEFAULT_LAMP_COLOR: Hsv = Hsv {
@@ -201,6 +205,7 @@ mod app {
     pub enum LightEvent {
         SOLID_COLOR { color: RGB8 },
         TICK { h: u8, m: u8, s: u8 },
+        FIRE,
     }
 
     #[shared]
@@ -247,6 +252,7 @@ mod app {
         wdg: IndependentWatchdog,
         enc_timer: CountDownTimer<TIM2>,
         encoder: Rotary<PB0<Input<PullUp>>, PB1<Input<PullUp>>>,
+        rng: Rand32,
     }
 
     #[init(local = [flash: Option<Parts> = None])]
@@ -339,7 +345,7 @@ mod app {
         for x in 0..16 {
             for y in 0..8 {
                 leds[leds_xy_to_n(x, y)] = hsv2rgb(Hsv {
-                    hue: (x * 255 / 16).try_into().unwrap(),
+                    hue: (x * 255 / 15).try_into().unwrap(),
                     sat: 255,
                     val: 3,
                 });
@@ -423,6 +429,7 @@ mod app {
                 wdg,
                 enc_timer,
                 encoder,
+                rng: Rand32::new(666),
             },
             init::Monotonics(mono),
         )
@@ -713,10 +720,37 @@ mod app {
         }
     }
 
-    #[task(shared = [], local = [ws, leds], priority = 16, capacity = 2)]
+    const FIRE_PALETTE: [u32; 11] = [
+        0x000000, 0x300000, 0x600000, 0x800400, 0xA01000, 0xB02000, 0xC02000, 0xC04000, 0xC06000,
+        0xC08000, 0x807080,
+    ];
+
+    fn fire_update(pixels: &mut [[u8; LED_COLS]; LED_ROWS + 1], rng: &mut Rand32) {
+        for i in (1..LED_ROWS + 1).rev() {
+            for j in 0..LED_COLS {
+                let mut n = 0;
+
+                if pixels[i - 1][j] > 0 {
+                    n = pixels[i - 1][j] - 1;
+                }
+                pixels[i][j] = n;
+            }
+        }
+
+        for j in 0..LED_COLS {
+            let range = ((FIRE_PALETTE.len() - 6) as u32)..((FIRE_PALETTE.len() - 2) as u32);
+            pixels[0][j] = rng.rand_range(range) as u8;
+        }
+    }
+
+    #[task(shared = [], local = [ws, leds, rng,
+                                 fire: [[u8; LED_COLS]; LED_ROWS + 1] = [[0; LED_COLS]; LED_ROWS + 1] ],
+                        priority = 16, capacity = 2)]
     fn light(cx: light::Context, ev: LightEvent) {
         let ws = cx.local.ws;
         let leds = cx.local.leds;
+        let fire = cx.local.fire;
+        let rng = cx.local.rng;
 
         match ev {
             LightEvent::TICK { h, m, s } => {
@@ -757,6 +791,18 @@ mod app {
             }
             LightEvent::SOLID_COLOR { color } => {
                 *leds = leds.map(|_| color);
+                leds_write(ws, leds);
+            }
+            LightEvent::FIRE => {
+                fire_update(fire, rng);
+
+                for i in 1..LED_ROWS + 1 {
+                    for j in 0..LED_COLS {
+                        let rgb: RGB8 =
+                            FIRE_PALETTE[fire[i][j] as usize].to_be_bytes()[1..4].as_pixels()[0];
+                        leds[leds_xy_to_n(j, LED_ROWS - i)] = rgb;
+                    }
+                }
                 leds_write(ws, leds);
             }
         }
@@ -1570,6 +1616,7 @@ mod app {
         Lamp {
             hue: u8,
         },
+        Fire,
     }
 
     #[derive(Debug)]
@@ -1626,7 +1673,10 @@ mod app {
         }
     }
 
-    #[task(shared = [], local = [curr_al: usize = 0, state: MainState = MainState::TitleScreen],
+    #[task(shared = [], local = [curr_al: usize = 0,
+                                 state: MainState = MainState::TitleScreen,
+                                 handle: Option<main_sm::SpawnHandle> = None,
+                                 ],
                         priority = 4, capacity = 4)]
     fn main_sm(cx: main_sm::Context, ev: MainEvent) {
         let state = cx.local.state;
@@ -1796,8 +1846,9 @@ mod app {
                 MainEvent::PPSTick { dt, gps_lock } => {
                     pps_tick_handler(dt, gps_lock);
                 }
-                MainEvent::LongButtonPress => {
-                    *state = MainState::TimeDisplay;
+                MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
+                    main_sm::spawn(MainEvent::Timeout).unwrap();
+                    *state = MainState::Fire;
                 }
                 MainEvent::Encoder { dir } => match dir {
                     EncDir::Clockwise => {
@@ -1820,6 +1871,22 @@ mod app {
                     }
                     _ => (),
                 },
+                _ => (),
+            },
+            MainState::Fire => match ev {
+                MainEvent::PPSTick { dt, gps_lock } => {
+                    pps_tick_handler(dt, gps_lock);
+                }
+                MainEvent::Timeout => {
+                    light::spawn(LightEvent::FIRE).unwrap();
+                    *cx.local.handle = main_sm::spawn_after(50.millis(), MainEvent::Timeout).ok();
+                }
+                MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
+                    if let Some(handle) = cx.local.handle.take() {
+                        handle.cancel().ok();
+                    }
+                    *state = MainState::TimeDisplay;
+                }
                 _ => (),
             },
         }
