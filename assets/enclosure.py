@@ -177,6 +177,15 @@ box = process(box).edges(">X and <Z").fillet(0.5)
 cover = process(cover).edges(">X and >Z").fillet(0.5)
 box = box.faces(">Z[2]").edges("(>X or >Y or <X or <Y)").fillet(0.4)
 
+cover_vents = (
+    cq.Sketch()
+    .rarray(5, 1, 22, 1)
+    .slot(50, 2.5, mode='a', angle=90)
+)
+
+cover = cover.faces('>Z').workplane().placeSketch(cover_vents)\
+    .cutThruAll()
+
 if WITH_LABELS:
     dt = datetime.now()\
         .strftime("%d/%m/%Y\n%H:%M:%S\nmryndzionek@gmail.com")
@@ -190,3 +199,5 @@ cover = cover.rotateAboutCenter((1, 0, 0), 180)\
 
 cq.exporters.export(box.union(cover), 'enclosure.svg')
 cq.exporters.export(box.union(cover), 'enclosure.stl')
+cq.exporters.export(cover.section(height=-2.5), 'cover_section.dxf')
+cq.exporters.export(base_shape(5).section(), 'front_section.dxf')
