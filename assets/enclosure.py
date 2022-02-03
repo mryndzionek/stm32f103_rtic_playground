@@ -1,3 +1,4 @@
+import math
 import cadquery as cq
 from datetime import datetime
 
@@ -6,8 +7,68 @@ HEIGHT = 75
 LEDS = 65
 WALL_TH = 3
 STAND_W = 7
-WITH_LABELS = False
+WITH_LABELS = True
 TOL = 0.5
+
+
+def gen_slot_data(w, h, nh, a=None):
+    assert(nh > 1)
+    assert((nh % 2) == 0)
+
+    a_rad = math.atan(h / w)
+    if a:
+        ac = math.tan(math.radians(a - 90))
+    else:
+        ac = - w / h
+    dy = h / nh
+    dx = dy / math.tan(a_rad)
+
+    p = (dx / 2, dy / 2)
+    pts = []
+
+    while True:
+        if (p[0] <= w / 2) or (p[1] <= h / 2):
+            pts.append(p)
+            pts.append((-p[0], -p[1]))
+            p = (p[0] + dx, p[1] + dy)
+        else:
+            break
+
+    assert(len(pts) == nh)
+
+    pts.sort()
+
+    def find_on_x(pt, x):
+        return (x, ac * (x - pt[0]) + pt[1])
+
+    def find_on_y(pt, y):
+        return (pt[0] + ((y - pt[1]) / ac), y)
+
+    def width(pt):
+        ps = [find_on_x(pt, w / 2), find_on_x(pt, -w / 2),
+              find_on_y(pt, h / 2), find_on_y(pt, -h / 2)]
+
+        ps = list(filter(lambda p: (p[0] <= w / 2) and (p[1] <= h / 2)
+                         and (p[0] >= -w / 2) and (p[1] >= -h / 2), ps))
+
+        d = math.dist(ps[0], ps[1])
+        return (((ps[0][0] + ps[1][0]) / 2), ((ps[0][1] + ps[1][1]) / 2)), d
+
+    wd = (math.hypot(dx, dy) / 2)
+    if a:
+        wd *= math.cos(math.radians(a) - a_rad)
+
+    return a if a else math.degrees(a_rad), wd, map(width, pts)
+
+
+def slots(w, h, n, a=None):
+    sk = cq.Sketch()
+    a, sw, data = gen_slot_data(w, h, n, a)
+
+    for c, w in data:
+        sk = sk.push([c]).slot(w, sw, a+90)
+
+    return sk
 
 
 def screw_shape(l):
@@ -77,8 +138,8 @@ def section_2(h):
     dy = LEDS / 2 - (wy / 2)
 
     notch = cq.Workplane("XY").box(5, 9, h)
-    a = notch.translate((dx, dy, 0))
-    b = notch.translate((LEDS - dx, - dy, 0))
+    a = notch.translate((dx, - dy, 0))
+    b = notch.translate((LEDS - dx, dy, 0))
     a = a.union(b)
     a = a.union(a.translate((-LEDS, 0, 0)))
     a = base_shape(h).cut(a)
@@ -147,14 +208,14 @@ def section_4(h):
 
 
 def section_5(h):
-    assert(h >= 4)
+    assert(h >= 3)
     dx = WIDTH - WALL_TH - STAND_W
     dy = HEIGHT - WALL_TH - STAND_W
     a = base_shape(h)
     return a.faces(">Z").workplane() \
         .rect(dx, dy, forConstruction=True)\
         .vertices()\
-        .cboreHole(3, 5, 3)
+        .cboreHole(3, 5, 2)
 
 
 def process(parts):
@@ -170,29 +231,17 @@ def process(parts):
     return p1
 
 
-box = [(4, section_1), (3, section_2), (40, section_3)]
-cover = [(2, section_4), (4, section_5)]
+box = [(7, section_1), (3, section_2), (40, section_3)]
+cover = [(1, section_4), (3, section_5)]
 
 box = process(box).edges(">X and <Z").fillet(0.5)
 cover = process(cover).edges(">X and >Z").fillet(0.5)
 box = box.faces(">Z[2]").edges("(>X or >Y or <X or <Y)").fillet(0.4)
 
-cover_vents = (
-    cq.Sketch()
-    .rarray(5, 1, 22, 1)
-    .slot(50, 2.5, mode='a', angle=90)
-)
-
-cover = cover.faces('>Z').workplane().placeSketch(cover_vents)\
-    .cutThruAll()
-
-if WITH_LABELS:
-    dt = datetime.now()\
-        .strftime("%d/%m/%Y\n%H:%M:%S\nmryndzionek@gmail.com")
-    cover = cover.faces("<Z").workplane()\
-        .center(-WIDTH / 2 + 15, HEIGHT / 2 - 10)\
-        .text(dt, 4, -1, font="Ubuntu Mono",
-              kind="bold", valign="top", halign="left")\
+sl = slots((WIDTH / 2) - 20, HEIGHT - 25, 14, 45)
+cover = cover.faces(">Z").workplane().pushPoints(
+    [(-WIDTH / 4 + 2, 0), (WIDTH / 4 - 2, 0)])\
+    .placeSketch(sl).cutThruAll()
 
 cover = cover.rotateAboutCenter((1, 0, 0), 180)\
     .translate((0, 100))
