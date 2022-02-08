@@ -203,6 +203,7 @@ mod app {
     #[derive(Debug)]
     #[allow(non_camel_case_types)]
     pub enum LightEvent {
+        INIT,
         SOLID_COLOR { color: RGB8 },
         TICK { h: u8, m: u8, s: u8 },
         FIRE,
@@ -352,8 +353,7 @@ mod app {
             }
         }
 
-        let mut ws = Ws2812::new(spi);
-        ws.write(leds.iter().cloned()).unwrap();
+        let ws = Ws2812::new(spi);
 
         let mut dcb = c.core.DCB;
         let dwt = c.core.DWT;
@@ -399,6 +399,7 @@ mod app {
 
         display::spawn_after(50.millis(), DispEvent::INIT).unwrap();
         main_sm::spawn_after(2.secs(), MainEvent::Timeout).unwrap();
+        light::spawn_after(50.millis(), LightEvent::INIT).unwrap();
 
         (
             Shared {
@@ -753,6 +754,9 @@ mod app {
         let rng = cx.local.rng;
 
         match ev {
+            LightEvent::INIT => {
+                ws.write(leds.iter().cloned()).unwrap();
+            }
             LightEvent::TICK { h, m, s } => {
                 let mut buf: String<4> = String::new();
                 buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
@@ -762,11 +766,11 @@ mod app {
 
                 if !is_night {
                     for i in 0..(s / 4) {
-                        leds[leds_xy_to_n(i as usize, 0)] = RGB8::new(0, LED_LEVEL_DAY + 1, 0);
+                        leds[leds_xy_to_n(i as usize, 0)] = RGB8::new(0, LED_LEVEL_DAY + 2, 0);
                     }
 
                     leds[leds_xy_to_n((s / 4) as usize, 0)] =
-                        RGB8::new(0, 1 + (LED_LEVEL_DAY * (s % 4) / 3), 0);
+                        RGB8::new(0, 2 + (LED_LEVEL_DAY * (s % 4) / 3), 0);
                 }
 
                 for (x, mut d) in buf.bytes().enumerate() {
@@ -1436,8 +1440,9 @@ mod app {
     }
 
     #[rustfmt::skip]
-    const _LED_DIGITS: [[u8; 5]; 10] =
+    const _LED_DIGITS: [[u8; 6]; 10] =
                                       [[0b111,
+                                        0b101,
                                         0b101,
                                         0b101,
                                         0b101,
@@ -1447,17 +1452,20 @@ mod app {
                                         0b110,
                                         0b010,
                                         0b010,
+                                        0b010,
                                         0b010],
 
                                        [0b111,
                                         0b001,
                                         0b011,
                                         0b100,
+                                        0b100,
                                         0b111],
 
                                        [0b111,
                                         0b001,
                                         0b111,
+                                        0b001,
                                         0b001,
                                         0b111],
                                         
@@ -1465,11 +1473,13 @@ mod app {
                                         0b101,
                                         0b111,
                                         0b001,
+                                        0b001,
                                         0b001],
 
                                        [0b111,
                                         0b100,
                                         0b110,
+                                        0b001,
                                         0b001,
                                         0b111],
 
@@ -1477,9 +1487,11 @@ mod app {
                                         0b100,
                                         0b111,
                                         0b101,
+                                        0b101,
                                         0b111],
 
                                        [0b111,
+                                        0b001,
                                         0b001,
                                         0b001,
                                         0b001,
@@ -1489,11 +1501,13 @@ mod app {
                                         0b101,
                                         0b111,
                                         0b101,
+                                        0b101,
                                         0b111],
 
                                        [0b111,
                                         0b101,
                                         0b111,
+                                        0b001,
                                         0b001,
                                         0b110],
                                         ];
@@ -1647,29 +1661,21 @@ mod app {
                     0 => {
                         if s == 0 {
                             buzzer::spawn(BuzzerEvent::HourChime).unwrap();
-                        } else {
-                            buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
                         }
                     }
                     59 => {
                         if s > 56 {
                             buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
-                        } else {
-                            buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
                         }
                     }
                     15 | 30 | 45 => {
                         if s == 0 {
                             buzzer::spawn(BuzzerEvent::QuarterChime).unwrap()
-                        } else {
-                            buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
                         }
                     }
-                    _ => buzzer::spawn(BuzzerEvent::SecondTick).unwrap(),
+                    _ => (),
                 }
             }
-        } else {
-            buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
         }
     }
 
@@ -1683,9 +1689,6 @@ mod app {
 
         match state {
             MainState::TitleScreen => match ev {
-                MainEvent::PPSTick { .. } => {
-                    buzzer::spawn(BuzzerEvent::SecondTick).unwrap();
-                }
                 MainEvent::Timeout => {
                     *state = MainState::TimeDisplay;
                 }
@@ -1775,7 +1778,7 @@ mod app {
                                     .iter()
                                     .map(|v| GAMMA8[*v as usize])
                                     .collect::<Vec<_, 3>>();
-                                let c = RGB8::new(rgb[0], rgb[1], rgb[2]) / 6;
+                                let c = RGB8::new(rgb[0], rgb[1], rgb[2]) / 2;
                                 light::spawn(LightEvent::SOLID_COLOR { color: c }).unwrap();
                                 *prev_val = Some(y);
                             }
