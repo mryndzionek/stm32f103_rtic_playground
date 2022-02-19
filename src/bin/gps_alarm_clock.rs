@@ -206,7 +206,7 @@ mod app {
         INIT,
         SOLID_COLOR { color: RGB8 },
         TICK { h: u8, m: u8, s: u8 },
-        FIRE,
+        UPDATE,
     }
 
     #[shared]
@@ -220,6 +220,7 @@ mod app {
         am_reset: bool,
         btn_pin: PA4<Input<PullUp>>,
         exti: EXTI,
+        leds: [RGB8; NUM_LEDS],
     }
 
     type Leds = ws2812_spi::Ws2812<
@@ -243,7 +244,6 @@ mod app {
         parser: Parser,
         display: Display,
         ws: Leds,
-        leds: [RGB8; NUM_LEDS],
         prod: bbqueue::Producer<'static, BUFF_SIZE>,
         cons: bbqueue::Consumer<'static, BUFF_SIZE>,
         dst: Duration,
@@ -412,6 +412,7 @@ mod app {
                 am_reset: true,
                 btn_pin: btn,
                 exti: c.device.EXTI,
+                leds,
             },
             Local {
                 led,
@@ -420,7 +421,6 @@ mod app {
                 parser,
                 display,
                 ws,
-                leds,
                 prod,
                 cons,
                 dst,
@@ -487,7 +487,7 @@ mod app {
         }
     }
 
-    #[task(shared = [datetime, pps_timeout, gps_locked], local = [cons, parser], priority = 2)]
+    #[task(shared = [datetime, pps_timeout, gps_locked], local = [cons, parser], priority = 2, capacity = 2)]
     fn parse(cx: parse::Context) {
         let cons = cx.local.cons;
         let parser = cx.local.parser;
@@ -614,7 +614,7 @@ mod app {
                 },
             );
             main_sm::spawn(MainEvent::PPSTick { dt, gps_lock: gps }).unwrap();
-            am_sensor::spawn_after(800.millis(), AmSensorEvent::START).unwrap();
+            am_sensor::spawn_after(800.millis(), AmSensorEvent::START).ok();
         }
     }
 
@@ -721,94 +721,63 @@ mod app {
         }
     }
 
-    const FIRE_PALETTE: [u32; 11] = [
-        0x000000, 0x300000, 0x600000, 0x800400, 0xA01000, 0xB02000, 0xC02000, 0xC04000, 0xC06000,
-        0xC08000, 0x807080,
-    ];
-
-    fn fire_update(pixels: &mut [[u8; LED_COLS]; LED_ROWS + 1], rng: &mut Rand32) {
-        for i in (1..LED_ROWS + 1).rev() {
-            for j in 0..LED_COLS {
-                let mut n = 0;
-
-                if pixels[i - 1][j] > 0 {
-                    n = pixels[i - 1][j] - 1;
-                }
-                pixels[i][j] = n;
-            }
-        }
-
-        for j in 0..LED_COLS {
-            let range = ((FIRE_PALETTE.len() - 6) as u32)..((FIRE_PALETTE.len() - 2) as u32);
-            pixels[0][j] = rng.rand_range(range) as u8;
-        }
-    }
-
-    #[task(shared = [], local = [ws, leds, rng,
-                                 fire: [[u8; LED_COLS]; LED_ROWS + 1] = [[0; LED_COLS]; LED_ROWS + 1] ],
+    #[task(shared = [leds], local = [ws],
                         priority = 16, capacity = 2)]
     fn light(cx: light::Context, ev: LightEvent) {
         let ws = cx.local.ws;
-        let leds = cx.local.leds;
-        let fire = cx.local.fire;
-        let rng = cx.local.rng;
+        let mut leds = cx.shared.leds;
 
         match ev {
-            LightEvent::INIT => {
+            LightEvent::INIT => leds.lock(|leds| {
                 ws.write(leds.iter().cloned()).unwrap();
-            }
+            }),
             LightEvent::TICK { h, m, s } => {
                 let mut buf: String<4> = String::new();
                 buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
 
-                *leds = leds.map(|_| RGB8::default());
-                let is_night = if h > 20 || h < 7 { true } else { false };
+                leds.lock(|leds| {
+                    *leds = leds.map(|_| RGB8::default());
+                    let is_night = if h > 20 || h < 7 { true } else { false };
 
-                if !is_night {
-                    for i in 0..(s / 4) {
-                        leds[leds_xy_to_n(i as usize, 0)] = RGB8::new(0, LED_LEVEL_DAY + 2, 0);
+                    if !is_night {
+                        for i in 0..(s / 4) {
+                            leds[leds_xy_to_n(i as usize, 0)] = RGB8::new(0, LED_LEVEL_DAY + 2, 0);
+                        }
+
+                        leds[leds_xy_to_n((s / 4) as usize, 0)] =
+                            RGB8::new(0, 2 + (LED_LEVEL_DAY * (s % 4) / 3), 0);
                     }
 
-                    leds[leds_xy_to_n((s / 4) as usize, 0)] =
-                        RGB8::new(0, 2 + (LED_LEVEL_DAY * (s % 4) / 3), 0);
-                }
-
-                for (x, mut d) in buf.bytes().enumerate() {
-                    d -= '0' as u8;
-                    leds_draw_digit(
-                        leds,
-                        1 + (4 * x),
-                        2,
-                        d as u8,
-                        RGB8::new(
-                            if is_night {
-                                LED_LEVEL_NIGHT
-                            } else {
-                                LED_LEVEL_DAY
-                            },
-                            0,
-                            0,
-                        ),
-                    );
-                }
-                leds_write(ws, leds);
+                    for (x, mut d) in buf.bytes().enumerate() {
+                        d -= '0' as u8;
+                        leds_draw_digit(
+                            leds,
+                            1 + (4 * x),
+                            2,
+                            d as u8,
+                            RGB8::new(
+                                if is_night {
+                                    LED_LEVEL_NIGHT
+                                } else {
+                                    LED_LEVEL_DAY
+                                },
+                                0,
+                                0,
+                            ),
+                        );
+                    }
+                    leds_write(ws, leds);
+                });
             }
             LightEvent::SOLID_COLOR { color } => {
-                *leds = leds.map(|_| color);
-                leds_write(ws, leds);
+                leds.lock(|leds| {
+                    *leds = leds.map(|_| color);
+                    leds_write(ws, leds);
+                });
             }
-            LightEvent::FIRE => {
-                fire_update(fire, rng);
-
-                for i in 1..LED_ROWS + 1 {
-                    for j in 0..LED_COLS {
-                        let rgb: RGB8 =
-                            FIRE_PALETTE[fire[i][j] as usize].to_be_bytes()[1..4].as_pixels()[0];
-                        leds[leds_xy_to_n(j, LED_ROWS - i)] = rgb;
-                    }
-                }
+            LightEvent::UPDATE => leds.lock(|leds| {
                 leds_write(ws, leds);
-            }
+            }),
         }
     }
 
@@ -1628,14 +1597,18 @@ mod app {
         Alarm,
         AlarmSetting,
         Lamp {
-            hue: u8,
+            hsv: Hsv,
         },
         Fire,
+        Coals {
+            is_rgb: bool,
+        },
     }
 
     #[derive(Debug)]
     pub enum MainEvent {
         Timeout,
+        Timeout2,
         PPSTick {
             dt: Option<PrimitiveDateTime>,
             gps_lock: bool,
@@ -1679,11 +1652,69 @@ mod app {
         }
     }
 
-    #[task(shared = [], local = [curr_al: usize = 0,
+    const FIRE_PALETTE: [u32; 11] = [
+        0x000000, 0x300000, 0x600000, 0x800400, 0xA01000, 0xB02000, 0xC02000, 0xC04000, 0xC06000,
+        0xC08000, 0x807080,
+    ];
+
+    fn fire_update(pixels: &mut [[u16; LED_COLS + 2]; LED_ROWS + 2], rng: &mut Rand32) {
+        for i in (1..LED_ROWS + 1).rev() {
+            for j in 1..LED_COLS + 1 {
+                let mut n = 0;
+
+                if pixels[i - 1][j] > 0 {
+                    n = pixels[i - 1][j] - 1;
+                }
+                pixels[i][j] = n;
+            }
+        }
+
+        for j in 1..LED_COLS + 1 {
+            let range = ((FIRE_PALETTE.len() - 6) as u32)..((FIRE_PALETTE.len() - 2) as u32);
+            pixels[0][j] = rng.rand_range(range) as u16;
+        }
+    }
+
+    fn diff_skewed(a: u16, b: u16) -> u16 {
+        if a > b {
+            return a - b;
+        } else {
+            return 0;
+        };
+    }
+
+    fn coals_transfer(pixels: &[[u16; LED_COLS + 2]; LED_ROWS + 2], x: u8, y: u8) -> u16 {
+        let mut v: u32 = 0;
+
+        for i in [-1, 0, 1] {
+            for j in [-1, 0, 1] {
+                let n = (y as i16 + i) as usize;
+                let m = (x as i16 + j) as usize;
+                v += diff_skewed(pixels[m][n], pixels[x as usize][y as usize]) as u32;
+            }
+        }
+
+        return if v > 0xFFFF { 0xFFFF } else { v as u16 };
+    }
+
+    fn coals_update(pixels: &mut [[u16; LED_COLS + 2]; LED_ROWS + 2]) {
+        for x in 1..LED_ROWS + 1 {
+            for y in 1..LED_COLS + 1 {
+                pixels[x][y] =
+                    diff_skewed(pixels[x][y], 32) + (coals_transfer(&pixels, x as u8, y as u8) / 8);
+            }
+        }
+    }
+
+    #[task(shared = [leds], local = [
+                                 curr_al: usize = 0,
                                  state: MainState = MainState::TitleScreen,
                                  handle: Option<main_sm::SpawnHandle> = None,
+                                 handle2: Option<main_sm::SpawnHandle> = None,
+                                 rng,
+                                 bmp: [[u16; LED_COLS + 2]; LED_ROWS + 2] = [[0; LED_COLS + 2]; LED_ROWS + 2],
                                  ],
-                        priority = 4, capacity = 4)]
+                        priority = 4, capacity = 6)]
     fn main_sm(cx: main_sm::Context, ev: MainEvent) {
         let state = cx.local.state;
 
@@ -1825,7 +1856,7 @@ mod app {
                 }
                 MainEvent::LongButtonPress => {
                     *state = MainState::Lamp {
-                        hue: DEFAULT_LAMP_COLOR.hue,
+                        hsv: DEFAULT_LAMP_COLOR,
                     };
                     light::spawn(LightEvent::SOLID_COLOR {
                         color: hsv2rgb(DEFAULT_LAMP_COLOR),
@@ -1845,30 +1876,33 @@ mod app {
                 }
                 _ => (),
             },
-            MainState::Lamp { hue } => match ev {
+            MainState::Lamp { hsv } => match ev {
                 MainEvent::PPSTick { dt, gps_lock } => {
                     pps_tick_handler(dt, gps_lock);
                 }
-                MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
+                MainEvent::ShortButtonPress => {
+                    hsv.val += 5;
+                    light::spawn(LightEvent::SOLID_COLOR {
+                        color: hsv2rgb(*hsv),
+                    })
+                    .unwrap();
+                }
+                MainEvent::LongButtonPress => {
                     main_sm::spawn(MainEvent::Timeout).unwrap();
                     *state = MainState::Fire;
                 }
                 MainEvent::Encoder { dir } => match dir {
                     EncDir::Clockwise => {
-                        *hue += 1;
-                        let mut hsv = DEFAULT_LAMP_COLOR;
-                        hsv.hue = *hue;
+                        hsv.hue += 1;
                         light::spawn(LightEvent::SOLID_COLOR {
-                            color: hsv2rgb(hsv),
+                            color: hsv2rgb(*hsv),
                         })
                         .unwrap();
                     }
                     EncDir::CounterClockwise => {
-                        *hue -= 1;
-                        let mut hsv = DEFAULT_LAMP_COLOR;
-                        hsv.hue = *hue;
+                        hsv.hue -= 1;
                         light::spawn(LightEvent::SOLID_COLOR {
-                            color: hsv2rgb(hsv),
+                            color: hsv2rgb(*hsv),
                         })
                         .unwrap();
                     }
@@ -1876,22 +1910,122 @@ mod app {
                 },
                 _ => (),
             },
-            MainState::Fire => match ev {
-                MainEvent::PPSTick { dt, gps_lock } => {
-                    pps_tick_handler(dt, gps_lock);
-                }
-                MainEvent::Timeout => {
-                    light::spawn(LightEvent::FIRE).unwrap();
-                    *cx.local.handle = main_sm::spawn_after(50.millis(), MainEvent::Timeout).ok();
-                }
-                MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
-                    if let Some(handle) = cx.local.handle.take() {
-                        handle.cancel().ok();
+            MainState::Fire => {
+                let mut leds = cx.shared.leds;
+                let bmp = cx.local.bmp;
+                let rng = cx.local.rng;
+
+                match ev {
+                    MainEvent::PPSTick { dt, gps_lock } => {
+                        pps_tick_handler(dt, gps_lock);
                     }
-                    *state = MainState::TimeDisplay;
+                    MainEvent::Timeout => {
+                        fire_update(bmp, rng);
+
+                        leds.lock(|leds| {
+                            for i in 1..LED_ROWS + 1 {
+                                for j in 1..LED_COLS + 1 {
+                                    let rgb: RGB8 = FIRE_PALETTE[bmp[i][j] as usize].to_be_bytes()
+                                        [1..4]
+                                        .as_pixels()[0];
+                                    leds[leds_xy_to_n(j - 1, LED_ROWS - i)] = rgb;
+                                }
+                            }
+                        });
+
+                        light::spawn(LightEvent::UPDATE).unwrap();
+                        *cx.local.handle =
+                            main_sm::spawn_after(50.millis(), MainEvent::Timeout).ok();
+                    }
+                    MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
+                        if let Some(handle) = cx.local.handle.take() {
+                            handle.cancel().ok();
+                        }
+                        leds.lock(|leds| {
+                            *leds = leds.map(|_| RGB8::default());
+                        });
+                        for i in 0..LED_ROWS + 2 {
+                            for j in 0..LED_COLS + 2 {
+                                bmp[i][j] = 0;
+                            }
+                        }
+                        *state = MainState::Coals { is_rgb: false };
+                        main_sm::spawn(MainEvent::Timeout).unwrap();
+                        main_sm::spawn(MainEvent::Timeout2).unwrap();
+                    }
+                    _ => (),
                 }
-                _ => (),
-            },
+            }
+            MainState::Coals { is_rgb } => {
+                let mut leds = cx.shared.leds;
+                let bmp = cx.local.bmp;
+                let rng = cx.local.rng;
+
+                match ev {
+                    MainEvent::PPSTick { dt, gps_lock } => {
+                        pps_tick_handler(dt, gps_lock);
+                    }
+                    MainEvent::Timeout => {
+                        coals_update(bmp);
+
+                        leds.lock(|leds| {
+                            for i in 1..LED_ROWS + 1 {
+                                for j in 1..LED_COLS + 1 {
+                                    let v = if bmp[i][j] > 0xFF { 0xFF } else { bmp[i][j] };
+                                    let c = if *is_rgb {
+                                        if v == 0 {
+                                            RGB8::default()
+                                        } else {
+                                            hsv2rgb(Hsv {
+                                                hue: v.try_into().unwrap(),
+                                                sat: 255,
+                                                val: v.try_into().unwrap(),
+                                            })
+                                        }
+                                    } else {
+                                        let rgb = SUNRISE_CMAP
+                                            [TryInto::<usize>::try_into(v).unwrap()]
+                                        .to_be_bytes()[1..4]
+                                            .iter()
+                                            .map(|v| GAMMA8[*v as usize])
+                                            .collect::<Vec<_, 3>>();
+                                        RGB8::new(rgb[0], rgb[1], rgb[2]) / 2
+                                    };
+
+                                    leds[leds_xy_to_n(j - 1, LED_ROWS - i)] = c;
+                                }
+                            }
+                        });
+
+                        light::spawn(LightEvent::UPDATE).unwrap();
+                        *cx.local.handle =
+                            main_sm::spawn_after(25.millis(), MainEvent::Timeout).ok();
+                    }
+                    MainEvent::Timeout2 => {
+                        let x = rng.rand_range(1..(LED_COLS + 1) as u32) as usize;
+                        let y = rng.rand_range(1..(LED_ROWS + 1) as u32) as usize;
+
+                        if bmp[y][x] <= 0x1FF {
+                            bmp[y][x] += rng.rand_range(0x300..0x3FF) as u16;
+                        }
+
+                        let tm = rng.rand_range(100..800);
+                        *cx.local.handle2 =
+                            main_sm::spawn_after(tm.millis(), MainEvent::Timeout2).ok();
+                    }
+                    MainEvent::ShortButtonPress => *state = MainState::Coals { is_rgb: !*is_rgb },
+                    MainEvent::LongButtonPress => {
+                        if let Some(handle) = cx.local.handle.take() {
+                            handle.cancel().ok();
+                        }
+                        if let Some(handle2) = cx.local.handle2.take() {
+                            handle2.cancel().ok();
+                        }
+                        *state = MainState::TimeDisplay;
+                    }
+                    _ => (),
+                }
+            }
         }
     }
 
