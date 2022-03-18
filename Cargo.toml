@@ -65,7 +65,7 @@ debug = 2
 debug-assertions = false # <-
 incremental = false
 lto = 'fat'
-opt-level = 's' # <-
+opt-level = 'z' # <-
 overflow-checks = false # <-
 
 # cargo test --release

@@ -117,7 +117,7 @@ mod app {
     #[monotonic(binds = SysTick, default = true)]
     type MyMono = DwtSystick<FREQ>;
 
-    const BUFF_SIZE: usize = 512;
+    const BUFF_SIZE: usize = 1024;
     const LED_ROWS: usize = 8;
     const LED_COLS: usize = 16;
     const NUM_LEDS: usize = LED_COLS * LED_ROWS;
@@ -205,7 +205,7 @@ mod app {
     pub enum LightEvent {
         INIT,
         SOLID_COLOR { color: RGB8 },
-        TICK { h: u8, m: u8, s: u8 },
+        TICK { h: u8, m: u8, s: u8, is_night: bool },
         UPDATE,
     }
 
@@ -277,7 +277,7 @@ mod app {
             .cfgr
             .use_hse(8.mhz())
             .sysclk(FREQ.hz())
-            .pclk1(24.mhz())
+            .pclk1(36.mhz())
             .freeze(&mut flash.acr);
         let mut afio = c.device.AFIO.constrain();
 
@@ -446,7 +446,7 @@ mod app {
                 wgr[0] = b;
                 wgr.commit(1);
                 if b == '\n' as u8 {
-                    parse::spawn().unwrap();
+                    parse::spawn().ok();
                 }
             } else {
                 defmt::error!("usart error!!!");
@@ -487,7 +487,7 @@ mod app {
         }
     }
 
-    #[task(shared = [datetime, pps_timeout, gps_locked], local = [cons, parser], priority = 2, capacity = 2)]
+    #[task(shared = [datetime, pps_timeout, gps_locked], local = [cons, parser], priority = 2, capacity = 1)]
     fn parse(cx: parse::Context) {
         let cons = cx.local.cons;
         let parser = cx.local.parser;
@@ -500,78 +500,79 @@ mod app {
 
         let mut res1 = (gps_locked, pps_timeout);
 
-        let rgr = cons.read().unwrap();
-        defmt::trace!("{}", &rgr.buf());
+        if let Some(rgr) = cons.read().ok() {
+            defmt::trace!("{}", &rgr.buf());
 
-        for result in parser.parse_from_bytes(&rgr) {
-            match result {
-                Ok(ParseResult::RMC(Some(rmc))) => {
-                    res1.lock(|gps_locked, pps_timeout| {
-                        if *gps_locked {
-                            if let Some(handle) = pps_timeout.take() {
-                                handle.cancel().ok();
+            for result in parser.parse_from_bytes(&rgr) {
+                match result {
+                    Ok(ParseResult::RMC(Some(rmc))) => {
+                        res1.lock(|gps_locked, pps_timeout| {
+                            if *gps_locked {
+                                if let Some(handle) = pps_timeout.take() {
+                                    handle.cancel().ok();
+                                }
+                            } else {
+                                *gps_locked = true;
+                                defmt::info!("GPS lock acquired");
                             }
-                        } else {
-                            *gps_locked = true;
-                            defmt::info!("GPS lock acquired");
-                        }
-                    });
+                        });
 
-                    let nmea0183::datetime::Date { day, month, year } = rmc.datetime.date;
-                    let nmea0183::datetime::Time {
-                        hours,
-                        minutes,
-                        seconds,
-                    } = rmc.datetime.time;
-                    defmt::debug!(
-                        "rmc {}:{}:{} {}-{}-{}",
-                        hours,
-                        minutes,
-                        seconds,
-                        day,
-                        month,
-                        year
-                    );
-                    let date = Date::from_calendar_date(
-                        year.try_into().unwrap(),
-                        month.try_into().unwrap(),
-                        day.try_into().unwrap(),
-                    )
-                    .unwrap();
-                    let time = Time::from_hms(hours, minutes, seconds as u8).unwrap();
-                    let date_time = PrimitiveDateTime::new(date, time);
-                    datetime.lock(|dt| match *dt {
-                        Some(dt) => {
-                            defmt::assert!(dt == date_time);
-                        }
-                        None => {
-                            *dt = Some(date_time);
-                        }
-                    })
-                }
-                Ok(ParseResult::GGA(Some(gga))) => {
-                    defmt::debug!(
-                        "Lon: {:?} Lat: {:?}",
-                        LongitudeWrapper(gga.longitude.clone()),
-                        LatitudeWrapper(gga.latitude.clone())
-                    );
-                    defmt::debug!(
-                        "sats in use {}, quality {}",
-                        gga.sat_in_use,
-                        gga.gps_quality as u8
-                    );
-                }
-                Ok(_) => {
-                    defmt::debug!("Incomplete NMEA")
-                }
-                Err(e) => {
-                    defmt::debug!("NMEA parsing error: {}", e)
+                        let nmea0183::datetime::Date { day, month, year } = rmc.datetime.date;
+                        let nmea0183::datetime::Time {
+                            hours,
+                            minutes,
+                            seconds,
+                        } = rmc.datetime.time;
+                        defmt::debug!(
+                            "rmc {}:{}:{} {}-{}-{}",
+                            hours,
+                            minutes,
+                            seconds,
+                            day,
+                            month,
+                            year
+                        );
+                        let date = Date::from_calendar_date(
+                            year.try_into().unwrap(),
+                            month.try_into().unwrap(),
+                            day.try_into().unwrap(),
+                        )
+                        .unwrap();
+                        let time = Time::from_hms(hours, minutes, seconds as u8).unwrap();
+                        let date_time = PrimitiveDateTime::new(date, time);
+                        datetime.lock(|dt| match *dt {
+                            Some(dt) => {
+                                defmt::assert!(dt == date_time);
+                            }
+                            None => {
+                                *dt = Some(date_time);
+                            }
+                        })
+                    }
+                    Ok(ParseResult::GGA(Some(gga))) => {
+                        defmt::debug!(
+                            "Lon: {:?} Lat: {:?}",
+                            LongitudeWrapper(gga.longitude.clone()),
+                            LatitudeWrapper(gga.latitude.clone())
+                        );
+                        defmt::debug!(
+                            "sats in use {}, quality {}",
+                            gga.sat_in_use,
+                            gga.gps_quality as u8
+                        );
+                    }
+                    Ok(_) => {
+                        defmt::debug!("Incomplete NMEA")
+                    }
+                    Err(e) => {
+                        defmt::debug!("NMEA parsing error: {}", e)
+                    }
                 }
             }
-        }
 
-        let len = rgr.len();
-        rgr.release(len);
+            let len = rgr.len();
+            rgr.release(len);
+        }
     }
 
     #[task(binds = EXTI1, shared = [datetime, gps_locked, pps_timeout, eeprom],
@@ -731,13 +732,12 @@ mod app {
             LightEvent::INIT => leds.lock(|leds| {
                 ws.write(leds.iter().cloned()).unwrap();
             }),
-            LightEvent::TICK { h, m, s } => {
+            LightEvent::TICK { h, m, s, is_night } => {
                 let mut buf: String<4> = String::new();
                 buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
 
                 leds.lock(|leds| {
                     *leds = leds.map(|_| RGB8::default());
-                    let is_night = if h > 20 || h < 7 { true } else { false };
 
                     if !is_night {
                         for i in 0..(s / 4) {
@@ -1713,10 +1713,12 @@ mod app {
                                  handle2: Option<main_sm::SpawnHandle> = None,
                                  rng,
                                  bmp: [[u16; LED_COLS + 2]; LED_ROWS + 2] = [[0; LED_COLS + 2]; LED_ROWS + 2],
+                                 is_night: bool = false,
                                  ],
                         priority = 4, capacity = 6)]
     fn main_sm(cx: main_sm::Context, ev: MainEvent) {
         let state = cx.local.state;
+        let is_night = cx.local.is_night;
 
         match state {
             MainState::TitleScreen => match ev {
@@ -1750,12 +1752,25 @@ mod app {
                         }
 
                         let (h, m, s) = dt.time().as_hms();
-                        light::spawn(LightEvent::TICK { h, m, s }).unwrap();
+                        *is_night = if h > 20 || h < 7 { true } else { false };
+                        light::spawn(LightEvent::TICK {
+                            h,
+                            m,
+                            s,
+                            is_night: *is_night,
+                        })
+                        .unwrap();
                     }
                 }
                 MainEvent::LongButtonPress => {
                     let (h, m, s) = ALARM_TIME.as_hms();
-                    light::spawn(LightEvent::TICK { h, m, s }).unwrap();
+                    light::spawn(LightEvent::TICK {
+                        h,
+                        m,
+                        s,
+                        is_night: *is_night,
+                    })
+                    .unwrap();
 
                     buzzer::spawn(BuzzerEvent::Alarm {
                         i: Some(*cx.local.curr_al),
@@ -1999,7 +2014,7 @@ mod app {
 
                         light::spawn(LightEvent::UPDATE).unwrap();
                         *cx.local.handle =
-                            main_sm::spawn_after(25.millis(), MainEvent::Timeout).ok();
+                            main_sm::spawn_after(10.millis(), MainEvent::Timeout).ok();
                     }
                     MainEvent::Timeout2 => {
                         let x = rng.rand_range(1..(LED_COLS + 1) as u32) as usize;
