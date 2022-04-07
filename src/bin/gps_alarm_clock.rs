@@ -122,7 +122,6 @@ mod app {
     const LED_COLS: usize = 16;
     const NUM_LEDS: usize = LED_COLS * LED_ROWS;
     const UTC_OFFSET: Duration = Duration::HOUR;
-    const ALARM_TIME: Time = time!(6:00:00);
     const SUNRISE_LEN: Duration = Duration::minutes(30);
     const BUZZER_BASE_FREQ_HZ: u32 = 6000;
     const LED_LEVEL_DAY: u8 = 16;
@@ -256,6 +255,7 @@ mod app {
         encoder: Rotary<PB0<Input<PullUp>>, PB1<Input<PullUp>>>,
         rng: Rand32,
         alarm_enabled: bool,
+        alarm_time: Time,
     }
 
     #[init(local = [flash: Option<Parts> = None])]
@@ -367,16 +367,41 @@ mod app {
 
         let mut eeprom = flash.eeprom(EEPROM_PARAMS);
         eeprom.init().unwrap();
-        let dst = match eeprom.read(0).unwrap() {
-            0 => Duration::ZERO,
-            1 => Duration::HOUR,
-            _ => {
-                eeprom.write(0, 1).unwrap();
-                Duration::HOUR
+        let dst = if let Some(v) = eeprom.read(0) {
+            match v {
+                0 => Duration::ZERO,
+                1 => Duration::HOUR,
+                _ => {
+                    eeprom.write(0, 1).unwrap();
+                    Duration::HOUR
+                }
             }
+        } else {
+            eeprom.write(0, 1).unwrap();
+            Duration::HOUR
         };
         defmt::info!("DST: {}", dst.whole_hours());
-        let alarm_enabled = eeprom.read(1).unwrap() != 0;
+
+        let alarm_enabled = if let Some(v) = eeprom.read(1) {
+            v != 0
+        } else {
+            eeprom.write(1, 0).unwrap();
+            false
+        };
+
+        let hm = if let Some(v) = eeprom.read(2) {
+            v
+        } else {
+            eeprom.write(2, 0).unwrap();
+            0
+        };
+
+        let alarm_time = Time::from_hms(
+            ((hm >> 8) % 24).try_into().unwrap(),
+            ((hm & 0xFF) % 60).try_into().unwrap(),
+            0,
+        )
+        .unwrap();
 
         let buzz_pin = gpioa.pa6.into_alternate_push_pull(&mut gpioa.crl);
         let mut buzz_pwm = Timer::new(c.device.TIM3, &clocks).pwm::<Tim3NoRemap, _, _, _>(
@@ -442,6 +467,7 @@ mod app {
                 encoder,
                 rng: Rand32::new(666),
                 alarm_enabled,
+                alarm_time,
             },
             init::Monotonics(mono),
         )
@@ -1731,6 +1757,11 @@ mod app {
         }
     }
 
+    fn disp_time(time: Time, is_night: bool) {
+        let (h, m, s) = time.as_hms();
+        light::spawn(LightEvent::TICK { h, m, s, is_night }).unwrap();
+    }
+
     #[task(shared = [leds, eeprom], local = [
                                  curr_al: usize = 0,
                                  state: MainState = MainState::TitleScreen,
@@ -1740,11 +1771,13 @@ mod app {
                                  bmp: [[u16; LED_COLS + 2]; LED_ROWS + 2] = [[0; LED_COLS + 2]; LED_ROWS + 2],
                                  is_night: bool = false,
                                  alarm_enabled,
+                                 alarm_time,
                                  ],
                         priority = 4, capacity = 6)]
     fn main_sm(cx: main_sm::Context, ev: MainEvent) {
         let state = cx.local.state;
         let is_night = cx.local.is_night;
+        let alarm_time = cx.local.alarm_time;
 
         match state {
             MainState::TitleScreen => match ev {
@@ -1760,7 +1793,7 @@ mod app {
                         if *cx.local.alarm_enabled {
                             if ![Weekday::Saturday, Weekday::Sunday].contains(&dt.date().weekday())
                             {
-                                if dt.time() == (ALARM_TIME - SUNRISE_LEN) {
+                                if dt.time() == (*alarm_time - SUNRISE_LEN) {
                                     defmt::info!("Starting sunrise");
 
                                     *state = MainState::Sunrise {
@@ -1792,15 +1825,7 @@ mod app {
                     }
                 }
                 MainEvent::LongButtonPress => {
-                    let (h, m, s) = ALARM_TIME.as_hms();
-                    light::spawn(LightEvent::TICK {
-                        h,
-                        m,
-                        s,
-                        is_night: *is_night,
-                    })
-                    .unwrap();
-
+                    disp_time(*alarm_time, *is_night);
                     buzzer::spawn(BuzzerEvent::Alarm {
                         i: Some(*cx.local.curr_al),
                     })
@@ -1914,6 +1939,13 @@ mod app {
                     }
                 }
                 MainEvent::LongButtonPress => {
+                    let (h, m, _) = alarm_time.as_hms();
+                    let hm: u16 = ((h as u16) << 8) | (m as u16);
+
+                    let mut eeprom = cx.shared.eeprom;
+                    eeprom.lock(|eeprom| {
+                        eeprom.write(2, hm).unwrap();
+                    });
                     *state = MainState::Lamp {
                         hsv: DEFAULT_LAMP_COLOR,
                     };
@@ -1933,6 +1965,17 @@ mod app {
                     })
                     .unwrap();
                 }
+                MainEvent::Encoder { dir } => match dir {
+                    EncDir::Clockwise => {
+                        *alarm_time += Duration::minutes(5);
+                        disp_time(*alarm_time, *is_night);
+                    }
+                    EncDir::CounterClockwise => {
+                        *alarm_time -= Duration::minutes(5);
+                        disp_time(*alarm_time, *is_night);
+                    }
+                    _ => (),
+                },
                 _ => (),
             },
             MainState::Lamp { hsv } => match ev {
@@ -2098,17 +2141,21 @@ mod app {
         match encoder.update().unwrap() {
             EncDir::Clockwise => {
                 *pos += 1;
-                main_sm::spawn(MainEvent::Encoder {
-                    dir: EncDir::Clockwise,
-                })
-                .unwrap();
+                if *pos % 2 == 0 {
+                    main_sm::spawn(MainEvent::Encoder {
+                        dir: EncDir::Clockwise,
+                    })
+                    .unwrap();
+                }
             }
             EncDir::CounterClockwise => {
                 *pos -= 1;
-                main_sm::spawn(MainEvent::Encoder {
-                    dir: EncDir::CounterClockwise,
-                })
-                .unwrap();
+                if *pos % 2 == 0 {
+                    main_sm::spawn(MainEvent::Encoder {
+                        dir: EncDir::CounterClockwise,
+                    })
+                    .unwrap();
+                }
             }
             EncDir::None => {}
         }
