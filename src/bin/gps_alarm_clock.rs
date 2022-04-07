@@ -123,9 +123,10 @@ mod app {
     const NUM_LEDS: usize = LED_COLS * LED_ROWS;
     const UTC_OFFSET: Duration = Duration::HOUR;
     const SUNRISE_LEN: Duration = Duration::minutes(30);
+    const ALARM_LEN: Duration = Duration::minutes(3);
     const BUZZER_BASE_FREQ_HZ: u32 = 6000;
-    const LED_LEVEL_DAY: u8 = 16;
-    const LED_LEVEL_NIGHT: u8 = 1;
+    const LED_COLOR_DAY: RGB8 = RGB8::new(16, 2, 0);
+    const LED_COLOR_NIGHT: RGB8 = RGB8::new(1, 0, 0);
     const DEFAULT_LAMP_COLOR: Hsv = Hsv {
         hue: 0,
         sat: 255,
@@ -205,8 +206,9 @@ mod app {
         INIT,
         SOLID_COLOR { color: RGB8 },
         TICK { h: u8, m: u8, s: u8, is_night: bool },
+        DIGITS { dg: [u8; 4] },
         UPDATE,
-        ALARM_CHANGE { set: bool, disp: bool },
+        ALARM_CHANGE { set: bool },
     }
 
     #[shared]
@@ -428,13 +430,6 @@ mod app {
         display::spawn_after(50.millis(), DispEvent::INIT).unwrap();
         main_sm::spawn_after(2.secs(), MainEvent::Timeout).unwrap();
         light::spawn_after(50.millis(), LightEvent::INIT).unwrap();
-        if alarm_enabled {
-            light::spawn(LightEvent::ALARM_CHANGE {
-                set: alarm_enabled,
-                disp: false,
-            })
-            .unwrap();
-        }
 
         (
             Shared {
@@ -779,25 +774,25 @@ mod app {
 
                     if !*cx.local.is_night {
                         for i in 0..(s / 4) {
-                            leds[leds_xy_to_n(i as usize, 0)] = RGB8::new(0, LED_LEVEL_DAY + 2, 0);
+                            leds[leds_xy_to_n(i as usize, 0)] = RGB8::new(0, 18, 2);
                         }
 
                         leds[leds_xy_to_n((s / 4) as usize, 0)] =
-                            RGB8::new(0, 2 + (LED_LEVEL_DAY * (s % 4) / 3), 0);
+                            RGB8::new(0, 2 + (18 * (s % 4) / 3), 0);
                     }
 
-                    let level = if *cx.local.is_night {
-                        LED_LEVEL_NIGHT
+                    let color = if *cx.local.is_night {
+                        LED_COLOR_NIGHT
                     } else {
-                        LED_LEVEL_DAY
+                        LED_COLOR_DAY
                     };
 
                     for (x, mut d) in buf.bytes().enumerate() {
                         d -= '0' as u8;
-                        leds_draw_digit(leds, 1 + (4 * x), 2, d as u8, RGB8::new(level, 0, 0));
+                        leds_draw_digit(leds, 1 + (4 * x), 2, d as u8, color);
                     }
                     if *cx.local.is_alarm {
-                        leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, level);
+                        leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, color.r);
                     }
                     leds_write(ws, leds);
                 });
@@ -811,23 +806,47 @@ mod app {
             LightEvent::UPDATE => leds.lock(|leds| {
                 leds_write(ws, leds);
             }),
-            LightEvent::ALARM_CHANGE { set, disp } => {
+            LightEvent::ALARM_CHANGE { set } => {
                 *cx.local.is_alarm = set;
-                if disp {
-                    leds.lock(|leds| {
-                        let level = if *cx.local.is_night {
-                            LED_LEVEL_NIGHT
-                        } else {
-                            LED_LEVEL_DAY
-                        };
-                        if *cx.local.is_alarm {
-                            leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, level);
-                        } else {
-                            leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, 0);
-                        }
-                        leds_write(ws, leds);
-                    });
-                }
+                leds.lock(|leds| {
+                    let color = if *cx.local.is_night {
+                        LED_COLOR_NIGHT
+                    } else {
+                        LED_COLOR_DAY
+                    };
+                    if *cx.local.is_alarm {
+                        leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, color.r);
+                    } else {
+                        leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, 0);
+                    }
+                    leds_write(ws, leds);
+                });
+            }
+            LightEvent::DIGITS { dg } => {
+                let color = if *cx.local.is_night {
+                    LED_COLOR_NIGHT
+                } else {
+                    LED_COLOR_DAY
+                };
+
+                leds.lock(|leds| {
+                    *leds = leds.map(|_| RGB8::default());
+
+                    for (x, d) in dg.iter().enumerate() {
+                        leds_draw_digit(
+                            leds,
+                            1 + (4 * x),
+                            2,
+                            *d % (_LED_DIGITS.len() as u8),
+                            color,
+                        );
+                    }
+
+                    if *cx.local.is_alarm {
+                        leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, color.r);
+                    }
+                    leds_write(ws, leds);
+                });
             }
         }
     }
@@ -1460,7 +1479,7 @@ mod app {
     }
 
     #[rustfmt::skip]
-    const _LED_DIGITS: [[u8; 6]; 10] =
+    const _LED_DIGITS: [[u8; 6]; 11] =
                                       [[0b111,
                                         0b101,
                                         0b101,
@@ -1530,6 +1549,13 @@ mod app {
                                         0b001,
                                         0b001,
                                         0b110],
+
+                                       [0b111,
+                                        0b001,
+                                        0b010,
+                                        0b010,
+                                        0b000,
+                                        0b010],
                                         ];
 
     fn leds_xy_to_n(x: usize, y: usize) -> usize {
@@ -1772,24 +1798,36 @@ mod app {
                                  is_night: bool = false,
                                  alarm_enabled,
                                  alarm_time,
+                                 alarm_dur: Duration = Duration::ZERO,
+                                 dt: Option<PrimitiveDateTime> = None,
                                  ],
                         priority = 4, capacity = 6)]
     fn main_sm(cx: main_sm::Context, ev: MainEvent) {
         let state = cx.local.state;
         let is_night = cx.local.is_night;
         let alarm_time = cx.local.alarm_time;
+        let datetime = cx.local.dt;
 
         match state {
             MainState::TitleScreen => match ev {
                 MainEvent::Timeout => {
                     *state = MainState::TimeDisplay;
+                    light::spawn(LightEvent::DIGITS {
+                        dg: [10, 10, 10, 10],
+                    })
+                    .unwrap();
+                    light::spawn(LightEvent::ALARM_CHANGE {
+                        set: *cx.local.alarm_enabled,
+                    })
+                    .unwrap();
                 }
                 _ => (),
             },
             MainState::TimeDisplay => match ev {
                 MainEvent::PPSTick { dt, gps_lock } => {
                     pps_tick_handler(dt, gps_lock);
-                    if let Some(dt) = dt {
+                    *datetime = dt;
+                    if let Some(dt) = *datetime {
                         if *cx.local.alarm_enabled {
                             if ![Weekday::Saturday, Weekday::Sunday].contains(&dt.date().weekday())
                             {
@@ -1812,16 +1850,9 @@ mod app {
                                 }
                             }
                         }
-
-                        let (h, m, s) = dt.time().as_hms();
+                        let h = dt.time().hour();
                         *is_night = if h > 20 || h < 7 { true } else { false };
-                        light::spawn(LightEvent::TICK {
-                            h,
-                            m,
-                            s,
-                            is_night: *is_night,
-                        })
-                        .unwrap();
+                        disp_time(dt.time(), *is_night);
                     }
                 }
                 MainEvent::LongButtonPress => {
@@ -1836,7 +1867,6 @@ mod app {
                     *cx.local.alarm_enabled ^= true;
                     light::spawn(LightEvent::ALARM_CHANGE {
                         set: *cx.local.alarm_enabled,
-                        disp: true,
                     })
                     .unwrap();
                     if *cx.local.alarm_enabled {
@@ -1852,6 +1882,7 @@ mod app {
             MainState::Sunrise { ramp, prev_val } => match ev {
                 MainEvent::PPSTick { dt, gps_lock } => {
                     pps_tick_handler(dt, gps_lock);
+                    *datetime = dt;
                     let v;
                     loop {
                         match ramp.next() {
@@ -1893,7 +1924,7 @@ mod app {
                                     .iter()
                                     .map(|v| GAMMA8[*v as usize])
                                     .collect::<Vec<_, 3>>();
-                                let c = RGB8::new(rgb[0], rgb[1], rgb[2]) / 2;
+                                let c = RGB8::new(rgb[0], rgb[1], rgb[2]) / 4;
                                 light::spawn(LightEvent::SOLID_COLOR { color: c }).unwrap();
                                 *prev_val = Some(y);
                             }
@@ -1904,6 +1935,7 @@ mod app {
                             })
                             .unwrap();
                             *state = MainState::Alarm;
+                            *cx.local.alarm_dur = Duration::ZERO;
                         }
                     }
                 }
@@ -1914,12 +1946,18 @@ mod app {
             },
             MainState::Alarm => match ev {
                 MainEvent::PPSTick { dt, gps_lock } => {
+                    *datetime = dt;
                     if let Some(dt) = dt {
                         display::spawn(DispEvent::UPDATE {
                             dt: dt,
                             gps: gps_lock,
                         })
                         .ok();
+                    }
+                    *cx.local.alarm_dur += Duration::SECOND;
+                    if *cx.local.alarm_dur == ALARM_LEN {
+                        buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
+                        *state = MainState::TimeDisplay;
                     }
                 }
                 MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
@@ -1980,6 +2018,7 @@ mod app {
             },
             MainState::Lamp { hsv } => match ev {
                 MainEvent::PPSTick { dt, gps_lock } => {
+                    *datetime = dt;
                     pps_tick_handler(dt, gps_lock);
                 }
                 MainEvent::ShortButtonPress => {
@@ -1990,8 +2029,12 @@ mod app {
                     .unwrap();
                 }
                 MainEvent::LongButtonPress => {
-                    main_sm::spawn(MainEvent::Timeout).unwrap();
                     *state = MainState::Fire;
+                    let mut leds = cx.shared.leds;
+                    leds.lock(|leds| {
+                        *leds = leds.map(|_| RGB8::default());
+                    });
+                    main_sm::spawn(MainEvent::Timeout).unwrap();
                 }
                 MainEvent::Encoder { dir } => match dir {
                     EncDir::Clockwise => {
@@ -2019,6 +2062,7 @@ mod app {
 
                 match ev {
                     MainEvent::PPSTick { dt, gps_lock } => {
+                        *datetime = dt;
                         pps_tick_handler(dt, gps_lock);
                     }
                     MainEvent::Timeout => {
@@ -2027,9 +2071,13 @@ mod app {
                         leds.lock(|leds| {
                             for i in 1..LED_ROWS + 1 {
                                 for j in 1..LED_COLS + 1 {
-                                    let rgb: RGB8 = FIRE_PALETTE[bmp[i][j] as usize].to_be_bytes()
-                                        [1..4]
-                                        .as_pixels()[0];
+                                    let k = if (bmp[i][j] as usize) < FIRE_PALETTE.len() {
+                                        bmp[i][j]
+                                    } else {
+                                        (FIRE_PALETTE.len() - 1) as u16
+                                    };
+                                    let rgb: RGB8 =
+                                        FIRE_PALETTE[k as usize].to_be_bytes()[1..4].as_pixels()[0];
                                     leds[leds_xy_to_n(j - 1, LED_ROWS - i)] = rgb;
                                 }
                             }
@@ -2065,6 +2113,7 @@ mod app {
 
                 match ev {
                     MainEvent::PPSTick { dt, gps_lock } => {
+                        *datetime = dt;
                         pps_tick_handler(dt, gps_lock);
                     }
                     MainEvent::Timeout => {
@@ -2124,6 +2173,16 @@ mod app {
                             handle2.cancel().ok();
                         }
                         *state = MainState::TimeDisplay;
+                        if let Some(dt) = *datetime {
+                            let h = dt.time().hour();
+                            *is_night = if h > 20 || h < 7 { true } else { false };
+                            disp_time(dt.time(), *is_night);
+                        } else {
+                            light::spawn(LightEvent::DIGITS {
+                                dg: [10, 10, 10, 10],
+                            })
+                            .unwrap();
+                        }
                     }
                     _ => (),
                 }
