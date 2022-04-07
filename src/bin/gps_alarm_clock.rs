@@ -207,6 +207,7 @@ mod app {
         SOLID_COLOR { color: RGB8 },
         TICK { h: u8, m: u8, s: u8, is_night: bool },
         UPDATE,
+        ALARM_CHANGE { set: bool, disp: bool },
     }
 
     #[shared]
@@ -254,6 +255,7 @@ mod app {
         enc_timer: CountDownTimer<TIM2>,
         encoder: Rotary<PB0<Input<PullUp>>, PB1<Input<PullUp>>>,
         rng: Rand32,
+        alarm_enabled: bool,
     }
 
     #[init(local = [flash: Option<Parts> = None])]
@@ -374,6 +376,7 @@ mod app {
             }
         };
         defmt::info!("DST: {}", dst.whole_hours());
+        let alarm_enabled = eeprom.read(1).unwrap() != 0;
 
         let buzz_pin = gpioa.pa6.into_alternate_push_pull(&mut gpioa.crl);
         let mut buzz_pwm = Timer::new(c.device.TIM3, &clocks).pwm::<Tim3NoRemap, _, _, _>(
@@ -400,6 +403,13 @@ mod app {
         display::spawn_after(50.millis(), DispEvent::INIT).unwrap();
         main_sm::spawn_after(2.secs(), MainEvent::Timeout).unwrap();
         light::spawn_after(50.millis(), LightEvent::INIT).unwrap();
+        if alarm_enabled {
+            light::spawn(LightEvent::ALARM_CHANGE {
+                set: alarm_enabled,
+                disp: false,
+            })
+            .unwrap();
+        }
 
         (
             Shared {
@@ -431,6 +441,7 @@ mod app {
                 enc_timer,
                 encoder,
                 rng: Rand32::new(666),
+                alarm_enabled,
             },
             init::Monotonics(mono),
         )
@@ -722,7 +733,7 @@ mod app {
         }
     }
 
-    #[task(shared = [leds], local = [ws],
+    #[task(shared = [leds], local = [ws, is_alarm: bool = false, is_night: bool = false],
                         priority = 16, capacity = 2)]
     fn light(cx: light::Context, ev: LightEvent) {
         let ws = cx.local.ws;
@@ -733,13 +744,14 @@ mod app {
                 ws.write(leds.iter().cloned()).unwrap();
             }),
             LightEvent::TICK { h, m, s, is_night } => {
+                *cx.local.is_night = is_night;
                 let mut buf: String<4> = String::new();
                 buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
 
                 leds.lock(|leds| {
                     *leds = leds.map(|_| RGB8::default());
 
-                    if !is_night {
+                    if !*cx.local.is_night {
                         for i in 0..(s / 4) {
                             leds[leds_xy_to_n(i as usize, 0)] = RGB8::new(0, LED_LEVEL_DAY + 2, 0);
                         }
@@ -748,23 +760,18 @@ mod app {
                             RGB8::new(0, 2 + (LED_LEVEL_DAY * (s % 4) / 3), 0);
                     }
 
+                    let level = if *cx.local.is_night {
+                        LED_LEVEL_NIGHT
+                    } else {
+                        LED_LEVEL_DAY
+                    };
+
                     for (x, mut d) in buf.bytes().enumerate() {
                         d -= '0' as u8;
-                        leds_draw_digit(
-                            leds,
-                            1 + (4 * x),
-                            2,
-                            d as u8,
-                            RGB8::new(
-                                if is_night {
-                                    LED_LEVEL_NIGHT
-                                } else {
-                                    LED_LEVEL_DAY
-                                },
-                                0,
-                                0,
-                            ),
-                        );
+                        leds_draw_digit(leds, 1 + (4 * x), 2, d as u8, RGB8::new(level, 0, 0));
+                    }
+                    if *cx.local.is_alarm {
+                        leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, level);
                     }
                     leds_write(ws, leds);
                 });
@@ -778,6 +785,24 @@ mod app {
             LightEvent::UPDATE => leds.lock(|leds| {
                 leds_write(ws, leds);
             }),
+            LightEvent::ALARM_CHANGE { set, disp } => {
+                *cx.local.is_alarm = set;
+                if disp {
+                    leds.lock(|leds| {
+                        let level = if *cx.local.is_night {
+                            LED_LEVEL_NIGHT
+                        } else {
+                            LED_LEVEL_DAY
+                        };
+                        if *cx.local.is_alarm {
+                            leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, level);
+                        } else {
+                            leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, 0);
+                        }
+                        leds_write(ws, leds);
+                    });
+                }
+            }
         }
     }
 
@@ -1706,7 +1731,7 @@ mod app {
         }
     }
 
-    #[task(shared = [leds], local = [
+    #[task(shared = [leds, eeprom], local = [
                                  curr_al: usize = 0,
                                  state: MainState = MainState::TitleScreen,
                                  handle: Option<main_sm::SpawnHandle> = None,
@@ -1714,6 +1739,7 @@ mod app {
                                  rng,
                                  bmp: [[u16; LED_COLS + 2]; LED_ROWS + 2] = [[0; LED_COLS + 2]; LED_ROWS + 2],
                                  is_night: bool = false,
+                                 alarm_enabled,
                                  ],
                         priority = 4, capacity = 6)]
     fn main_sm(cx: main_sm::Context, ev: MainEvent) {
@@ -1731,23 +1757,26 @@ mod app {
                 MainEvent::PPSTick { dt, gps_lock } => {
                     pps_tick_handler(dt, gps_lock);
                     if let Some(dt) = dt {
-                        if ![Weekday::Saturday, Weekday::Sunday].contains(&dt.date().weekday()) {
-                            if dt.time() == (ALARM_TIME - SUNRISE_LEN) {
-                                defmt::info!("Starting sunrise");
+                        if *cx.local.alarm_enabled {
+                            if ![Weekday::Saturday, Weekday::Sunday].contains(&dt.date().weekday())
+                            {
+                                if dt.time() == (ALARM_TIME - SUNRISE_LEN) {
+                                    defmt::info!("Starting sunrise");
 
-                                *state = MainState::Sunrise {
-                                    ramp: Bresenham::new(
-                                        (0, 0),
-                                        (
-                                            SUNRISE_LEN.whole_seconds().try_into().unwrap(),
-                                            SUNRISE_CMAP.len().try_into().unwrap(),
-                                        ),
-                                    )
-                                    .peekable(),
-                                    prev_val: None,
-                                };
+                                    *state = MainState::Sunrise {
+                                        ramp: Bresenham::new(
+                                            (0, 0),
+                                            (
+                                                SUNRISE_LEN.whole_seconds().try_into().unwrap(),
+                                                SUNRISE_CMAP.len().try_into().unwrap(),
+                                            ),
+                                        )
+                                        .peekable(),
+                                        prev_val: None,
+                                    };
 
-                                main_sm::spawn(ev).unwrap();
+                                    main_sm::spawn(ev).unwrap();
+                                }
                             }
                         }
 
@@ -1777,6 +1806,21 @@ mod app {
                     })
                     .unwrap();
                     *state = MainState::AlarmSetting;
+                }
+                MainEvent::ShortButtonPress => {
+                    *cx.local.alarm_enabled ^= true;
+                    light::spawn(LightEvent::ALARM_CHANGE {
+                        set: *cx.local.alarm_enabled,
+                        disp: true,
+                    })
+                    .unwrap();
+                    if *cx.local.alarm_enabled {
+                        buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
+                    }
+                    let mut eeprom = cx.shared.eeprom;
+                    eeprom.lock(|eeprom| {
+                        eeprom.write(1, *cx.local.alarm_enabled as u16).unwrap();
+                    });
                 }
                 _ => (),
             },
