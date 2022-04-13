@@ -125,12 +125,13 @@ mod app {
     const SUNRISE_LEN: Duration = Duration::minutes(30);
     const ALARM_LEN: Duration = Duration::minutes(3);
     const BUZZER_BASE_FREQ_HZ: u32 = 6000;
+    const LED_COLOR_PROJECTOR: RGB8 = RGB8::new(64, 2, 0);
     const LED_COLOR_DAY: RGB8 = RGB8::new(16, 2, 0);
     const LED_COLOR_NIGHT: RGB8 = RGB8::new(1, 0, 0);
     const DEFAULT_LAMP_COLOR: Hsv = Hsv {
         hue: 0,
         sat: 255,
-        val: 100,
+        val: 10,
     };
 
     const EEPROM_PARAMS: Params = Params {
@@ -205,10 +206,19 @@ mod app {
     pub enum LightEvent {
         INIT,
         SOLID_COLOR { color: RGB8 },
-        TICK { h: u8, m: u8, s: u8, is_night: bool },
+        TICK { h: u8, m: u8, s: u8 },
+        TICK_MODE { mode: LightTickMode },
         DIGITS { dg: [u8; 4] },
         UPDATE,
         ALARM_CHANGE { set: bool },
+    }
+
+    #[derive(Debug, PartialEq, Clone)]
+    #[allow(non_camel_case_types)]
+    pub enum LightTickMode {
+        DAY,
+        NIGHT,
+        PROJECTOR,
     }
 
     #[shared]
@@ -344,12 +354,12 @@ mod app {
             NoMiso,
             gpiob.pb15.into_alternate_push_pull(&mut gpiob.crh),
         );
-        let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3000.khz(), clocks);
+        let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3500.khz(), clocks);
         let mut leds = [RGB8::default(); NUM_LEDS];
 
         for x in 0..16 {
             for y in 0..8 {
-                leds[leds_xy_to_n(x, y)] = hsv2rgb(Hsv {
+                leds[leds_xy_to_n(x, y, false)] = hsv2rgb(Hsv {
                     hue: (x * 255 / 15).try_into().unwrap(),
                     sat: 255,
                     val: 3,
@@ -754,48 +764,63 @@ mod app {
         }
     }
 
-    #[task(shared = [leds], local = [ws, is_alarm: bool = false, is_night: bool = false],
+    #[task(shared = [leds], local = [ws, is_alarm: bool = false, mode: LightTickMode = LightTickMode::DAY],
                         priority = 16, capacity = 2)]
     fn light(cx: light::Context, ev: LightEvent) {
         let ws = cx.local.ws;
         let mut leds = cx.shared.leds;
+        let curr_mode = cx.local.mode;
+
+        let (color, mirror) = match *curr_mode {
+            LightTickMode::NIGHT => (LED_COLOR_NIGHT, false),
+            LightTickMode::DAY => (LED_COLOR_DAY, false),
+            LightTickMode::PROJECTOR => (LED_COLOR_PROJECTOR, true),
+        };
 
         match ev {
             LightEvent::INIT => leds.lock(|leds| {
                 ws.write(leds.iter().cloned()).unwrap();
             }),
-            LightEvent::TICK { h, m, s, is_night } => {
-                *cx.local.is_night = is_night;
+            LightEvent::TICK { h, m, s } => {
                 let mut buf: String<4> = String::new();
                 buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
 
                 leds.lock(|leds| {
                     *leds = leds.map(|_| RGB8::default());
 
-                    if !*cx.local.is_night {
+                    if *curr_mode == LightTickMode::DAY {
                         for i in 0..(s / 4) {
-                            leds[leds_xy_to_n(i as usize, 0)] = RGB8::new(0, 18, 2);
+                            leds[leds_xy_to_n(i as usize, 0, mirror)] = RGB8::new(0, color.r, 2);
                         }
 
-                        leds[leds_xy_to_n((s / 4) as usize, 0)] =
-                            RGB8::new(0, 2 + (18 * (s % 4) / 3), 0);
+                        leds[leds_xy_to_n((s / 4) as usize, 0, mirror)] = RGB8::new(
+                            0,
+                            (2 + (color.r as usize) * ((s as usize) % 4) / 3)
+                                .try_into()
+                                .unwrap(),
+                            0,
+                        );
                     }
-
-                    let color = if *cx.local.is_night {
-                        LED_COLOR_NIGHT
-                    } else {
-                        LED_COLOR_DAY
-                    };
 
                     for (x, mut d) in buf.bytes().enumerate() {
                         d -= '0' as u8;
-                        leds_draw_digit(leds, 1 + (4 * x), 2, d as u8, color);
+                        leds_draw_digit(
+                            leds,
+                            if x > 1 { 1 } else { 0 } + (4 * x),
+                            2,
+                            d as u8,
+                            color,
+                            mirror,
+                        );
                     }
                     if *cx.local.is_alarm {
-                        leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, color.r);
+                        leds[leds_xy_to_n(0, 1, mirror)] = RGB8::new(0, 0, color.r);
                     }
                     leds_write(ws, leds);
                 });
+            }
+            LightEvent::TICK_MODE { mode } => {
+                *curr_mode = mode;
             }
             LightEvent::SOLID_COLOR { color } => {
                 leds.lock(|leds| {
@@ -809,41 +834,33 @@ mod app {
             LightEvent::ALARM_CHANGE { set } => {
                 *cx.local.is_alarm = set;
                 leds.lock(|leds| {
-                    let color = if *cx.local.is_night {
-                        LED_COLOR_NIGHT
-                    } else {
-                        LED_COLOR_DAY
-                    };
+                    let mirror = *curr_mode == LightTickMode::PROJECTOR;
                     if *cx.local.is_alarm {
-                        leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, color.r);
+                        leds[leds_xy_to_n(0, 1, mirror)] = RGB8::new(0, 0, color.r);
                     } else {
-                        leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, 0);
+                        leds[leds_xy_to_n(0, 1, mirror)] = RGB8::new(0, 0, 0);
                     }
                     leds_write(ws, leds);
                 });
             }
             LightEvent::DIGITS { dg } => {
-                let color = if *cx.local.is_night {
-                    LED_COLOR_NIGHT
-                } else {
-                    LED_COLOR_DAY
-                };
-
                 leds.lock(|leds| {
                     *leds = leds.map(|_| RGB8::default());
 
                     for (x, d) in dg.iter().enumerate() {
                         leds_draw_digit(
                             leds,
-                            1 + (4 * x),
+                            if x > 1 { 1 } else { 0 } + (4 * x),
                             2,
                             *d % (_LED_DIGITS.len() as u8),
                             color,
+                            *curr_mode == LightTickMode::PROJECTOR,
                         );
                     }
 
                     if *cx.local.is_alarm {
-                        leds[leds_xy_to_n(0, 1)] = RGB8::new(0, 0, color.r);
+                        leds[leds_xy_to_n(0, 1, *curr_mode == LightTickMode::PROJECTOR)] =
+                            RGB8::new(0, 0, color.r);
                     }
                     leds_write(ws, leds);
                 });
@@ -1550,26 +1567,33 @@ mod app {
                                         0b001,
                                         0b110],
 
-                                       [0b111,
-                                        0b001,
+                                       [0b101,
+                                        0b101,
                                         0b010,
                                         0b010,
-                                        0b000,
-                                        0b010],
+                                        0b101,
+                                        0b101],
                                         ];
 
-    fn leds_xy_to_n(x: usize, y: usize) -> usize {
+    fn leds_xy_to_n(x: usize, y: usize, m: bool) -> usize {
         let _y = 7 - y;
-        let _x = 15 - x;
+        let _x = if m { x } else { 15 - x };
         let n = if _x > 7 { NUM_LEDS / 2 } else { 0 };
         return n + (_y * 8) + (_x % 8);
     }
 
-    fn leds_draw_digit(leds: &mut [RGB8; NUM_LEDS], x: usize, y: usize, d: u8, color: RGB8) {
+    fn leds_draw_digit(
+        leds: &mut [RGB8; NUM_LEDS],
+        x: usize,
+        y: usize,
+        d: u8,
+        color: RGB8,
+        mirror: bool,
+    ) {
         for (j, bits) in _LED_DIGITS[d as usize].iter().enumerate() {
             for i in 0..3 {
                 if bits & (1 << (2 - i)) != 0 {
-                    leds[leds_xy_to_n(i + x, j + y)] = color;
+                    leds[leds_xy_to_n(i + x, j + y, mirror)] = color;
                 }
             }
         }
@@ -1783,9 +1807,9 @@ mod app {
         }
     }
 
-    fn disp_time(time: Time, is_night: bool) {
+    fn disp_time(time: Time) {
         let (h, m, s) = time.as_hms();
-        light::spawn(LightEvent::TICK { h, m, s, is_night }).unwrap();
+        light::spawn(LightEvent::TICK { h, m, s }).unwrap();
     }
 
     #[task(shared = [leds, eeprom], local = [
@@ -1795,7 +1819,7 @@ mod app {
                                  handle2: Option<main_sm::SpawnHandle> = None,
                                  rng,
                                  bmp: [[u16; LED_COLS + 2]; LED_ROWS + 2] = [[0; LED_COLS + 2]; LED_ROWS + 2],
-                                 is_night: bool = false,
+                                 mode: LightTickMode = LightTickMode::DAY,
                                  alarm_enabled,
                                  alarm_time,
                                  alarm_dur: Duration = Duration::ZERO,
@@ -1804,7 +1828,7 @@ mod app {
                         priority = 4, capacity = 6)]
     fn main_sm(cx: main_sm::Context, ev: MainEvent) {
         let state = cx.local.state;
-        let is_night = cx.local.is_night;
+        let curr_mode = cx.local.mode;
         let alarm_time = cx.local.alarm_time;
         let datetime = cx.local.dt;
 
@@ -1851,12 +1875,33 @@ mod app {
                             }
                         }
                         let h = dt.time().hour();
-                        *is_night = if h > 20 || h < 7 { true } else { false };
-                        disp_time(dt.time(), *is_night);
+
+                        match *curr_mode {
+                            LightTickMode::DAY => {
+                                if h > 20 || h < 7 {
+                                    *curr_mode = LightTickMode::NIGHT;
+                                    light::spawn(LightEvent::TICK_MODE {
+                                        mode: (*curr_mode).clone(),
+                                    })
+                                    .unwrap();
+                                }
+                            }
+                            LightTickMode::NIGHT => {
+                                if h <= 20 && h >= 7 {
+                                    *curr_mode = LightTickMode::DAY;
+                                    light::spawn(LightEvent::TICK_MODE {
+                                        mode: (*curr_mode).clone(),
+                                    })
+                                    .unwrap();
+                                }
+                            }
+                            LightTickMode::PROJECTOR => {}
+                        }
+                        disp_time(dt.time());
                     }
                 }
                 MainEvent::LongButtonPress => {
-                    disp_time(*alarm_time, *is_night);
+                    disp_time(*alarm_time);
                     buzzer::spawn(BuzzerEvent::Alarm {
                         i: Some(*cx.local.curr_al),
                     })
@@ -2006,11 +2051,11 @@ mod app {
                 MainEvent::Encoder { dir } => match dir {
                     EncDir::Clockwise => {
                         *alarm_time += Duration::minutes(5);
-                        disp_time(*alarm_time, *is_night);
+                        disp_time(*alarm_time);
                     }
                     EncDir::CounterClockwise => {
                         *alarm_time -= Duration::minutes(5);
-                        disp_time(*alarm_time, *is_night);
+                        disp_time(*alarm_time);
                     }
                     _ => (),
                 },
@@ -2078,7 +2123,11 @@ mod app {
                                     };
                                     let rgb: RGB8 =
                                         FIRE_PALETTE[k as usize].to_be_bytes()[1..4].as_pixels()[0];
-                                    leds[leds_xy_to_n(j - 1, LED_ROWS - i)] = rgb;
+                                    leds[leds_xy_to_n(
+                                        j - 1,
+                                        LED_ROWS - i,
+                                        *curr_mode == LightTickMode::PROJECTOR,
+                                    )] = rgb;
                                 }
                             }
                         });
@@ -2087,7 +2136,18 @@ mod app {
                         *cx.local.handle =
                             main_sm::spawn_after(50.millis(), MainEvent::Timeout).ok();
                     }
-                    MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
+                    MainEvent::ShortButtonPress => {
+                        if *curr_mode == LightTickMode::PROJECTOR {
+                            *curr_mode = LightTickMode::DAY;
+                        } else {
+                            *curr_mode = LightTickMode::PROJECTOR;
+                        }
+                        light::spawn(LightEvent::TICK_MODE {
+                            mode: (*curr_mode).clone(),
+                        })
+                        .unwrap();
+                    }
+                    MainEvent::LongButtonPress => {
                         if let Some(handle) = cx.local.handle.take() {
                             handle.cancel().ok();
                         }
@@ -2143,14 +2203,18 @@ mod app {
                                         RGB8::new(rgb[0], rgb[1], rgb[2]) / 2
                                     };
 
-                                    leds[leds_xy_to_n(j - 1, LED_ROWS - i)] = c;
+                                    leds[leds_xy_to_n(
+                                        j - 1,
+                                        LED_ROWS - i,
+                                        *curr_mode == LightTickMode::PROJECTOR,
+                                    )] = c;
                                 }
                             }
                         });
 
                         light::spawn(LightEvent::UPDATE).unwrap();
                         *cx.local.handle =
-                            main_sm::spawn_after(10.millis(), MainEvent::Timeout).ok();
+                            main_sm::spawn_after(30.millis(), MainEvent::Timeout).ok();
                     }
                     MainEvent::Timeout2 => {
                         let x = rng.rand_range(1..(LED_COLS + 1) as u32) as usize;
@@ -2160,7 +2224,7 @@ mod app {
                             bmp[y][x] += rng.rand_range(0x300..0x3FF) as u16;
                         }
 
-                        let tm = rng.rand_range(100..800);
+                        let tm = rng.rand_range(200..1300);
                         *cx.local.handle2 =
                             main_sm::spawn_after(tm.millis(), MainEvent::Timeout2).ok();
                     }
@@ -2174,9 +2238,7 @@ mod app {
                         }
                         *state = MainState::TimeDisplay;
                         if let Some(dt) = *datetime {
-                            let h = dt.time().hour();
-                            *is_night = if h > 20 || h < 7 { true } else { false };
-                            disp_time(dt.time(), *is_night);
+                            disp_time(dt.time());
                         } else {
                             light::spawn(LightEvent::DIGITS {
                                 dg: [10, 10, 10, 10],
