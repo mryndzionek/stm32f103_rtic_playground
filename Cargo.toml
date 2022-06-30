@@ -24,7 +24,6 @@ nb = "1.0.0"
 void = { default-features = false, version = "1.0.2" }
 
 embedded-graphics = "0.7"
-embedded-dma = "0.1.2"
 profont = "0.5.0"
 ssd1306 = "0.7"
 

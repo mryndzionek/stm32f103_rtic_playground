@@ -12,21 +12,12 @@ mod app {
     use defmt::{write, Format, Formatter};
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
     use eeprom::{EEPROMExt, Params, EEPROM};
-    use embedded_graphics::{
-        image::{Image, ImageRaw},
-        mono_font::MonoTextStyleBuilder,
-        pixelcolor::BinaryColor,
-        prelude::*,
-        text::{Baseline, Text},
-    };
-    use embedded_hal::digital::v2::{InputPin, OutputPin};
     use heapless::{String, Vec};
     use nmea0183::{
         coords::{Hemisphere, Latitude, Longitude},
         ParseResult, Parser, Sentence,
     };
     use oorandom::Rand32;
-    use profont::{PROFONT_18_POINT, PROFONT_9_POINT};
     use rgb::AsPixels;
     use rotary_encoder_hal::{Direction as EncDir, Rotary};
     use rtic::Monotonic;
@@ -34,19 +25,17 @@ mod app {
         hsv::{hsv2rgb, Hsv},
         SmartLedsWrite, RGB, RGB8,
     };
-    use ssd1306::{mode::BufferedGraphicsMode, prelude::*, I2CDisplayInterface, Ssd1306};
     use stm32f103_rtic_playground as _;
     use stm32f1xx_hal::gpio::{
         gpioa::{PA1, PA4},
         gpiob::{PB0, PB1},
         gpioc::PC13,
-        Alternate, Cr, Edge, ExtiPin, Input, OpenDrain, Output, PullDown, PullUp, PushPull, CRL,
+        Alternate, Edge, ExtiPin, Input, Output, PullDown, PullUp, PushPull,
     };
     use stm32f1xx_hal::watchdog::IndependentWatchdog;
     use stm32f1xx_hal::{
         flash::{FlashSize, Parts, SectorSize},
-        i2c::{BlockingI2c, DutyCycle, Mode},
-        pac::{EXTI, I2C1, TIM2, TIM3},
+        pac::{EXTI, TIM2, TIM3},
         prelude::*,
         pwm::{Channel, Pwm, C1},
         serial::{Config, Rx2, Serial},
@@ -98,20 +87,6 @@ mod app {
             );
         }
     }
-
-    type Display = Ssd1306<
-        I2CInterface<
-            BlockingI2c<
-                I2C1,
-                (
-                    stm32f1xx_hal::gpio::gpiob::PB6<Alternate<OpenDrain>>,
-                    stm32f1xx_hal::gpio::gpiob::PB7<Alternate<OpenDrain>>,
-                ),
-            >,
-        >,
-        DisplaySize128x32,
-        BufferedGraphicsMode<DisplaySize128x32>,
-    >;
 
     const FREQ: u32 = 72_000_000;
     #[monotonic(binds = SysTick, default = true)]
@@ -190,17 +165,6 @@ mod app {
 
     static BB: BBBuffer<BUFF_SIZE> = BBBuffer::new();
 
-    pub enum DispState {
-        INIT,
-        READY,
-    }
-
-    #[derive(Debug)]
-    pub enum DispEvent {
-        INIT,
-        UPDATE { dt: PrimitiveDateTime, gps: bool },
-    }
-
     #[derive(Debug)]
     #[allow(non_camel_case_types)]
     pub enum LightEvent {
@@ -227,9 +191,6 @@ mod app {
         gps_locked: bool,
         pps_timeout: Option<pps_timeout::SpawnHandle>,
         eeprom: EEPROM<&'static mut stm32f1xx_hal::flash::Parts>,
-        env_data: Option<(u16, i16)>,
-        am_pin: stm32f1xx_hal::gpio::Pin<stm32f1xx_hal::gpio::Dynamic, CRL, 'A', 0_u8>,
-        am_reset: bool,
         btn_pin: PA4<Input<PullUp>>,
         exti: EXTI,
         leds: [RGB8; NUM_LEDS],
@@ -254,13 +215,10 @@ mod app {
         pps: PA1<Input<PullDown>>,
         rx: Rx2,
         parser: Parser,
-        display: Display,
         ws: Leds,
         prod: bbqueue::Producer<'static, BUFF_SIZE>,
         cons: bbqueue::Consumer<'static, BUFF_SIZE>,
         dst: Duration,
-        am_crl: Cr<stm32f1xx_hal::gpio::CRL, 'A'>,
-        am_afio: stm32f1xx_hal::afio::Parts,
         buzz_pwm: Pwm<TIM3, Tim3NoRemap, C1, stm32f1xx_hal::gpio::gpioa::PA6<Alternate<PushPull>>>,
         wdg: IndependentWatchdog,
         enc_timer: CountDownTimer<TIM2>,
@@ -326,29 +284,7 @@ mod app {
         btn.enable_interrupt(&mut c.device.EXTI);
         btn.trigger_on_edge(&mut c.device.EXTI, Edge::Falling);
 
-        // Set up I2C.
         let mut gpiob = c.device.GPIOB.split();
-        let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob.crl);
-        let sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob.crl);
-        let i2c = BlockingI2c::i2c1(
-            c.device.I2C1,
-            (scl, sda),
-            &mut afio.mapr,
-            Mode::Fast {
-                frequency: 400_000.hz(),
-                duty_cycle: DutyCycle::Ratio2to1,
-            },
-            clocks,
-            10000,
-            10,
-            10000,
-            10000,
-        );
-
-        let interface = I2CDisplayInterface::new(i2c);
-        let display = Ssd1306::new(interface, DisplaySize128x32, DisplayRotation::Rotate0)
-            .into_buffered_graphics_mode();
-
         let pins = (
             NoSck,
             NoMiso,
@@ -423,11 +359,6 @@ mod app {
         );
         buzz_pwm.set_duty(Channel::C1, 2 * (buzz_pwm.get_max_duty() / 100));
 
-        let mut am_pin = gpioa.pa0.into_dynamic(&mut gpioa.crl);
-        am_pin.make_push_pull_output(&mut gpioa.crl);
-        am_pin.set_high().unwrap();
-        let am_crl = gpioa.crl;
-
         let enc_a = gpiob.pb0.into_pull_up_input(&mut gpiob.crl);
         let enc_b = gpiob.pb1.into_pull_up_input(&mut gpiob.crl);
         let encoder = Rotary::new(enc_a, enc_b);
@@ -437,7 +368,6 @@ mod app {
 
         let wdg = IndependentWatchdog::new(c.device.IWDG);
 
-        display::spawn_after(50.millis(), DispEvent::INIT).unwrap();
         main_sm::spawn_after(2.secs(), MainEvent::Timeout).unwrap();
         light::spawn_after(50.millis(), LightEvent::INIT).unwrap();
 
@@ -447,9 +377,6 @@ mod app {
                 gps_locked: false,
                 pps_timeout: None,
                 eeprom,
-                env_data: None,
-                am_pin,
-                am_reset: true,
                 btn_pin: btn,
                 exti: c.device.EXTI,
                 leds,
@@ -459,13 +386,10 @@ mod app {
                 pps,
                 rx,
                 parser,
-                display,
                 ws,
                 prod,
                 cons,
                 dst,
-                am_crl,
-                am_afio: afio,
                 buzz_pwm,
                 wdg,
                 enc_timer,
@@ -657,7 +581,6 @@ mod app {
                 },
             );
             main_sm::spawn(MainEvent::PPSTick { dt, gps_lock: gps }).unwrap();
-            am_sensor::spawn_after(800.millis(), AmSensorEvent::START).ok();
         }
     }
 
@@ -666,86 +589,6 @@ mod app {
         let mut gps_locked = cx.shared.gps_locked;
         defmt::warn!("GPS lock lost");
         gps_locked.lock(|gps_locked| *gps_locked = false)
-    }
-
-    fn display_big_txt(d: &mut Display, str: &str) {
-        let text_style = MonoTextStyleBuilder::new()
-            .font(&PROFONT_18_POINT)
-            .text_color(BinaryColor::On)
-            .build();
-
-        Text::with_baseline(str, Point::new(18, 10), text_style, Baseline::Top)
-            .draw(d)
-            .unwrap();
-    }
-
-    fn display_small_txt(d: &mut Display, str: &str) {
-        let text_style = MonoTextStyleBuilder::new()
-            .font(&PROFONT_9_POINT)
-            .text_color(BinaryColor::On)
-            .build();
-
-        Text::with_baseline(str, Point::new(18, 0), text_style, Baseline::Top)
-            .draw(d)
-            .unwrap();
-    }
-
-    #[task(shared = [env_data], local = [display, state: DispState = DispState::INIT], priority = 2)]
-    fn display(cx: display::Context, ev: DispEvent) {
-        let d = cx.local.display;
-        let s = cx.local.state;
-        let mut env_data_r = cx.shared.env_data;
-
-        match s {
-            DispState::INIT => match ev {
-                DispEvent::INIT => {
-                    defmt::info!("Initializing display");
-                    d.init().unwrap();
-                    //d.set_brightness(Brightness::BRIGHTEST).unwrap();
-                    d.clear();
-                    let title_screen_raw: ImageRaw<BinaryColor> =
-                        ImageRaw::new(include_bytes!("../../assets/title_screen.raw"), 128);
-                    let title_screen = Image::new(&title_screen_raw, Point::new(0, 0));
-                    title_screen.draw(d).unwrap();
-                    d.flush().unwrap();
-                    *s = DispState::READY;
-                }
-                _ => {}
-            },
-            DispState::READY => match ev {
-                DispEvent::UPDATE { dt, gps } => {
-                    let mut buf: String<32> = String::new();
-                    let (h, m, s) = dt.time().as_hms();
-                    buf.write_fmt(format_args!("{:02}:{:02}:{:02}", h, m, s))
-                        .unwrap();
-                    d.clear();
-                    display_big_txt(d, buf.as_str());
-
-                    if gps {
-                        let gps_icon_raw: ImageRaw<BinaryColor> =
-                            ImageRaw::new(include_bytes!("../../assets/sat_icon.raw"), 14);
-                        let gps_icon = Image::new(&gps_icon_raw, Point::new(0, 0));
-                        gps_icon.draw(d).unwrap();
-                    }
-
-                    if let Some((h, t)) = env_data_r.lock(|env_data| *env_data) {
-                        buf.clear();
-                        buf.write_fmt(format_args!(
-                            "{}.{}% {}.{}C",
-                            h / 10,
-                            h % 10,
-                            t / 10,
-                            t % 10
-                        ))
-                        .unwrap();
-                        display_small_txt(d, buf.as_str());
-                    }
-
-                    d.flush().unwrap();
-                }
-                _ => {}
-            },
-        }
     }
 
     fn leds_write(ws: &mut Leds, leds: &[RGB<u8>; NUM_LEDS]) {
@@ -875,172 +718,6 @@ mod app {
         ACK2,
         RX,
     }
-
-    #[derive(Debug, PartialEq, Format)]
-    pub enum AmSensorEvent {
-        START,
-        DATA { data: [u16; 5] },
-        TIMEOUT,
-    }
-
-    #[task(binds = EXTI0, shared = [am_pin, am_reset],
-                          local = [last: u32 = 0,
-                                   i: usize = 0,
-                                   data: [u16; 5] = [0; 5]], priority = 2)]
-    fn am_data_isr(cx: am_data_isr::Context) {
-        let pin_r = cx.shared.am_pin;
-        let reset_r = cx.shared.am_reset;
-
-        let i = cx.local.i;
-        let data = cx.local.data;
-
-        let pps_int = (pin_r, reset_r).lock(|pin, reset| {
-            let intr = pin.check_interrupt();
-            if intr {
-                pin.clear_interrupt_pending_bit();
-                if *reset {
-                    *i = 0;
-                    *cx.local.last = 0;
-                    *reset = false;
-                }
-            }
-            intr
-        });
-
-        if pps_int {
-            *i += 1;
-            let curr = monotonics::now().ticks();
-            let len = (curr - *cx.local.last) / 72;
-
-            if *i > 2 {
-                if (*i % 2) == 1 {
-                    if !(len >= 40 && len < 70) {
-                        defmt::warn!("Wrong preamble length");
-                    }
-                } else {
-                    let j = (*i - 4) / 2;
-                    let (n, m) = ((j / 8), 7 - (j % 8));
-                    match len {
-                        20..=40 => {
-                            data[n] &= !(1 << m);
-                        }
-                        60..=80 => {
-                            data[n] |= 1 << m;
-                        }
-                        _ => defmt::warn!("Wrong bit length"),
-                    }
-                }
-                if *i >= 83 {
-                    defmt::debug!("Sensor data: {}", data);
-                    *i = 0;
-                    am_sensor::spawn(AmSensorEvent::DATA { data: data.clone() }).unwrap();
-                }
-            }
-            *cx.local.last = curr;
-        }
-    }
-
-    #[task(shared = [env_data, am_pin, am_reset, exti], local = [am_crl, am_afio,
-                                                 state: AmSensorState = AmSensorState::START1,
-                                                 handle: Option<am_sensor::SpawnHandle> = None,
-                                                 count: u16 = 0],
-                                                 priority = 1, capacity = 2)]
-    fn am_sensor(cx: am_sensor::Context, ev: AmSensorEvent) {
-        let mut pin_r = cx.shared.am_pin;
-        let mut crl = cx.local.am_crl;
-        let mut env_data_r = cx.shared.env_data;
-        let mut afio = cx.local.am_afio;
-        let mut exti = cx.shared.exti;
-        let mut reset_r = cx.shared.am_reset;
-
-        let handle = cx.local.handle;
-
-        let s = cx.local.state;
-
-        pin_r.lock(|pin| match s {
-            AmSensorState::START1 => {
-                if ev == AmSensorEvent::START {
-                    pin.make_push_pull_output(&mut crl);
-                    pin.set_low().unwrap();
-                    am_sensor::spawn_after(20.millis(), AmSensorEvent::TIMEOUT).unwrap();
-                    reset_r.lock(|reset| {
-                        *reset = true;
-                    });
-                    *s = AmSensorState::START2;
-                } else {
-                    defmt::warn!("Unexpected event {}. Ignoring", ev);
-                }
-            }
-            AmSensorState::START2 => {
-                defmt::assert!(ev == AmSensorEvent::TIMEOUT);
-                pin.set_high().unwrap();
-                am_sensor::spawn_after(20.micros(), AmSensorEvent::TIMEOUT).unwrap();
-                *s = AmSensorState::ACK1;
-            }
-            AmSensorState::ACK1 => {
-                defmt::assert!(ev == AmSensorEvent::TIMEOUT);
-                pin.make_pull_up_input(&mut crl);
-                am_sensor::spawn_after(30.micros(), AmSensorEvent::TIMEOUT).unwrap();
-                *s = AmSensorState::ACK2;
-            }
-            AmSensorState::ACK2 => {
-                defmt::assert!(ev == AmSensorEvent::TIMEOUT);
-                if pin.is_low().unwrap() {
-                    pin.make_interrupt_source(&mut afio);
-
-                    exti.lock(|exti| {
-                        pin.enable_interrupt(exti);
-                        pin.trigger_on_edge(exti, Edge::RisingFalling);
-                    });
-                    *handle = am_sensor::spawn_after(10.millis(), AmSensorEvent::TIMEOUT).ok();
-                    *s = AmSensorState::RX;
-                } else {
-                    defmt::warn!("Sensor not responding");
-                    env_data_r.lock(|env_data| *env_data = None);
-                    *s = AmSensorState::START1;
-                }
-            }
-            AmSensorState::RX => {
-                match ev {
-                    AmSensorEvent::DATA { data } => {
-                        if let Some(handle) = handle.take() {
-                            handle.cancel().ok();
-                        }
-                        let crc: u16 = data.split_last().unwrap().1.iter().sum();
-
-                        let crc_exp: u8 = data[4] as u8;
-                        let temp: u16 = (data[2] << 8) | data[3];
-                        let humi: u16 = (data[0] << 8) | data[1];
-
-                        let signed_temp = if temp & 0x8000 != 0 {
-                            -((temp & 0x7FF) as i16)
-                        } else {
-                            temp as i16
-                        };
-
-                        defmt::info!("Temp: {},  RHS: {}", signed_temp, humi);
-                        if crc as u8 != crc_exp {
-                            defmt::warn!("Wrong CRC");
-                        }
-                        env_data_r.lock(|env_data| *env_data = Some((humi, signed_temp)));
-                    }
-                    AmSensorEvent::TIMEOUT => {
-                        defmt::warn!("Timeout");
-                    }
-                    _ => {
-                        defmt::panic!()
-                    }
-                }
-
-                exti.lock(|exti| {
-                    pin.disable_interrupt(exti);
-                });
-                pin.clear_interrupt_pending_bit();
-                *s = AmSensorState::START1;
-            }
-        });
-    }
-
     pub enum BuzzerState {
         Chime {
             is_on: bool,
@@ -1721,14 +1398,8 @@ mod app {
         },
     }
 
-    fn pps_tick_handler(dt: Option<PrimitiveDateTime>, gps_lock: bool) {
+    fn pps_tick_handler(dt: Option<PrimitiveDateTime>, _gps_lock: bool) {
         if let Some(dt) = dt {
-            display::spawn(DispEvent::UPDATE {
-                dt: dt,
-                gps: gps_lock,
-            })
-            .ok();
-
             let (h, s) = (dt.time().hour(), dt.time().second());
             if h < 22 && h > 7 {
                 match dt.time().minute() {
@@ -1990,15 +1661,8 @@ mod app {
                 _ => (),
             },
             MainState::Alarm => match ev {
-                MainEvent::PPSTick { dt, gps_lock } => {
+                MainEvent::PPSTick { dt, gps_lock: _ } => {
                     *datetime = dt;
-                    if let Some(dt) = dt {
-                        display::spawn(DispEvent::UPDATE {
-                            dt: dt,
-                            gps: gps_lock,
-                        })
-                        .ok();
-                    }
                     *cx.local.alarm_dur += Duration::SECOND;
                     if *cx.local.alarm_dur == ALARM_LEN {
                         buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
@@ -2012,15 +1676,7 @@ mod app {
                 _ => {}
             },
             MainState::AlarmSetting => match ev {
-                MainEvent::PPSTick { dt, gps_lock } => {
-                    if let Some(dt) = dt {
-                        display::spawn(DispEvent::UPDATE {
-                            dt: dt,
-                            gps: gps_lock,
-                        })
-                        .unwrap()
-                    }
-                }
+                MainEvent::PPSTick { dt: _, gps_lock: _ } => {}
                 MainEvent::LongButtonPress => {
                     let (h, m, _) = alarm_time.as_hms();
                     let hm: u16 = ((h as u16) << 8) | (m as u16);

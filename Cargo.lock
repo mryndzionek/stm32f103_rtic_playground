@@ -742,7 +742,6 @@ dependencies = [
  "defmt-rtt",
  "dwt-systick-monotonic",
  "eeprom",
- "embedded-dma",
  "embedded-graphics",
  "embedded-hal",
  "heapless",
