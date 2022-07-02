@@ -92,10 +92,12 @@ mod app {
     #[monotonic(binds = SysTick, default = true)]
     type MyMono = DwtSystick<FREQ>;
 
+    const SEG_LEN: usize = (5 * 4) + (2 * 3); // 7 segments, 5 with 4 LEDs, 2 with 3 LEDs
+    const NUM_SEGS: usize = 7;
     const BUFF_SIZE: usize = 1024;
     const LED_ROWS: usize = 8;
     const LED_COLS: usize = 16;
-    const NUM_LEDS: usize = LED_COLS * LED_ROWS;
+    const NUM_LEDS: usize = SEG_LEN * 6 + (2 * 2);
     const UTC_OFFSET: Duration = Duration::HOUR;
     const SUNRISE_LEN: Duration = Duration::minutes(30);
     const ALARM_LEN: Duration = Duration::minutes(3);
@@ -115,6 +117,14 @@ mod app {
         page_size: SectorSize::Sz1K,
         page_count: 2,
     };
+
+    const SYMBOL_TO_SEGS: [u8; 11] = [
+        0b1111110, 0b1000010, 0b0110111, 0b1100111, 0b1001011, 0b1101101, 0b1111101, 0b1000110,
+        0b1111111, 0b1101111, 0b1011011, // X
+    ];
+
+    const SEG_TO_OFFSET: [(usize, usize); NUM_SEGS] =
+        [(0, 4), (4, 3), (7, 4), (11, 4), (15, 4), (19, 3), (22, 4)];
 
     const SUNRISE_CMAP: [u32; 256] = [
         0x20000, 0x70000, 0xD0000, 0x120000, 0x160000, 0x190000, 0x1C0000, 0x1F0000, 0x220000,
@@ -172,7 +182,7 @@ mod app {
         SOLID_COLOR { color: RGB8 },
         TICK { h: u8, m: u8, s: u8 },
         TICK_MODE { mode: LightTickMode },
-        DIGITS { dg: [u8; 4] },
+        DIGITS { dg: [u8; 6], col1: bool, col2: bool },
         UPDATE,
         ALARM_CHANGE { set: bool },
     }
@@ -614,10 +624,10 @@ mod app {
         let mut leds = cx.shared.leds;
         let curr_mode = cx.local.mode;
 
-        let (color, mirror) = match *curr_mode {
-            LightTickMode::NIGHT => (LED_COLOR_NIGHT, false),
-            LightTickMode::DAY => (LED_COLOR_DAY, false),
-            LightTickMode::PROJECTOR => (LED_COLOR_PROJECTOR, true),
+        let color = match *curr_mode {
+            LightTickMode::NIGHT => LED_COLOR_NIGHT,
+            LightTickMode::DAY => LED_COLOR_DAY,
+            LightTickMode::PROJECTOR => LED_COLOR_PROJECTOR,
         };
 
         match ev {
@@ -625,39 +635,20 @@ mod app {
                 ws.write(leds.iter().cloned()).unwrap();
             }),
             LightEvent::TICK { h, m, s } => {
-                let mut buf: String<4> = String::new();
-                buf.write_fmt(format_args!("{:02}{:02}", h, m)).unwrap();
+                let mut buf: String<6> = String::new();
+                buf.write_fmt(format_args!("{:02}{:02}{:02}", h, m, s))
+                    .unwrap();
 
                 leds.lock(|leds| {
                     *leds = leds.map(|_| RGB8::default());
 
-                    if *curr_mode == LightTickMode::DAY {
-                        for i in 0..(s / 4) {
-                            leds[leds_xy_to_n(i as usize, 0, mirror)] = RGB8::new(0, color.r, 2);
-                        }
-
-                        leds[leds_xy_to_n((s / 4) as usize, 0, mirror)] = RGB8::new(
-                            0,
-                            (2 + (color.r as usize) * ((s as usize) % 4) / 3)
-                                .try_into()
-                                .unwrap(),
-                            0,
-                        );
-                    }
-
                     for (x, mut d) in buf.bytes().enumerate() {
                         d -= '0' as u8;
-                        leds_draw_digit(
-                            leds,
-                            if x > 1 { 1 } else { 0 } + (4 * x),
-                            2,
-                            d as u8,
-                            color,
-                            mirror,
-                        );
+                        leds_draw_digit(leds, x, d, color);
                     }
-                    if *cx.local.is_alarm {
-                        leds[leds_xy_to_n(0, 1, mirror)] = RGB8::new(0, 0, color.r);
+                    if s % 2 == 1 {
+                        leds_draw_colon(leds, 0, color);
+                        leds_draw_colon(leds, 1, color);
                     }
                     leds_write(ws, leds);
                 });
@@ -686,24 +677,19 @@ mod app {
                     leds_write(ws, leds);
                 });
             }
-            LightEvent::DIGITS { dg } => {
+            LightEvent::DIGITS { dg, col1, col2 } => {
                 leds.lock(|leds| {
                     *leds = leds.map(|_| RGB8::default());
 
                     for (x, d) in dg.iter().enumerate() {
-                        leds_draw_digit(
-                            leds,
-                            if x > 1 { 1 } else { 0 } + (4 * x),
-                            2,
-                            *d % (_LED_DIGITS.len() as u8),
-                            color,
-                            *curr_mode == LightTickMode::PROJECTOR,
-                        );
+                        leds_draw_digit(leds, x, *d % (SYMBOL_TO_SEGS.len() as u8), color);
                     }
 
-                    if *cx.local.is_alarm {
-                        leds[leds_xy_to_n(0, 1, *curr_mode == LightTickMode::PROJECTOR)] =
-                            RGB8::new(0, 0, color.r);
+                    if col1 {
+                        leds_draw_colon(leds, 0, color);
+                    }
+                    if col2 {
+                        leds_draw_colon(leds, 1, color);
                     }
                     leds_write(ws, leds);
                 });
@@ -1172,86 +1158,6 @@ mod app {
         }
     }
 
-    #[rustfmt::skip]
-    const _LED_DIGITS: [[u8; 6]; 11] =
-                                      [[0b111,
-                                        0b101,
-                                        0b101,
-                                        0b101,
-                                        0b101,
-                                        0b111],
-
-                                       [0b010,
-                                        0b110,
-                                        0b010,
-                                        0b010,
-                                        0b010,
-                                        0b010],
-
-                                       [0b111,
-                                        0b001,
-                                        0b011,
-                                        0b100,
-                                        0b100,
-                                        0b111],
-
-                                       [0b111,
-                                        0b001,
-                                        0b111,
-                                        0b001,
-                                        0b001,
-                                        0b111],
-                                        
-                                       [0b101,
-                                        0b101,
-                                        0b111,
-                                        0b001,
-                                        0b001,
-                                        0b001],
-
-                                       [0b111,
-                                        0b100,
-                                        0b110,
-                                        0b001,
-                                        0b001,
-                                        0b111],
-
-                                       [0b011,
-                                        0b100,
-                                        0b111,
-                                        0b101,
-                                        0b101,
-                                        0b111],
-
-                                       [0b111,
-                                        0b001,
-                                        0b001,
-                                        0b001,
-                                        0b001,
-                                        0b001],
-
-                                       [0b111,
-                                        0b101,
-                                        0b111,
-                                        0b101,
-                                        0b101,
-                                        0b111],
-
-                                       [0b111,
-                                        0b101,
-                                        0b111,
-                                        0b001,
-                                        0b001,
-                                        0b110],
-
-                                       [0b101,
-                                        0b101,
-                                        0b010,
-                                        0b010,
-                                        0b101,
-                                        0b101],
-                                        ];
-
     fn leds_xy_to_n(x: usize, y: usize, m: bool) -> usize {
         let _y = 7 - y;
         let _x = if m { x } else { 15 - x };
@@ -1259,21 +1165,23 @@ mod app {
         return n + (_y * 8) + (_x % 8);
     }
 
-    fn leds_draw_digit(
-        leds: &mut [RGB8; NUM_LEDS],
-        x: usize,
-        y: usize,
-        d: u8,
-        color: RGB8,
-        mirror: bool,
-    ) {
-        for (j, bits) in _LED_DIGITS[d as usize].iter().enumerate() {
-            for i in 0..3 {
-                if bits & (1 << (2 - i)) != 0 {
-                    leds[leds_xy_to_n(i + x, j + y, mirror)] = color;
+    fn leds_draw_digit(leds: &mut [RGB8; NUM_LEDS], x: usize, d: u8, color: RGB8) {
+        let dx = x * SEG_LEN + (2 * (x / 2));
+        let segs = SYMBOL_TO_SEGS[d as usize];
+        for i in 0..NUM_SEGS {
+            if segs & (1 << i) != 0 {
+                let (o, l) = SEG_TO_OFFSET[i];
+                for i in dx + o..dx + o + l {
+                    leds[i] = color;
                 }
             }
         }
+    }
+
+    fn leds_draw_colon(leds: &mut [RGB8; NUM_LEDS], x: usize, color: RGB8) {
+        let offset = 2 * SEG_LEN + ((2 * SEG_LEN) + 2) * x;
+        leds[offset] = color;
+        leds[offset + 1] = color;
     }
 
     #[derive(Debug, PartialEq, Format)]
@@ -1508,7 +1416,9 @@ mod app {
                 MainEvent::Timeout => {
                     *state = MainState::TimeDisplay;
                     light::spawn(LightEvent::DIGITS {
-                        dg: [10, 10, 10, 10],
+                        dg: [10, 10, 10, 10, 10, 10],
+                        col1: true,
+                        col2: true,
                     })
                     .unwrap();
                     light::spawn(LightEvent::ALARM_CHANGE {
@@ -1897,7 +1807,9 @@ mod app {
                             disp_time(dt.time());
                         } else {
                             light::spawn(LightEvent::DIGITS {
-                                dg: [10, 10, 10, 10],
+                                dg: [10, 10, 10, 10, 10, 10],
+                                col1: true,
+                                col2: true,
                             })
                             .unwrap();
                         }
