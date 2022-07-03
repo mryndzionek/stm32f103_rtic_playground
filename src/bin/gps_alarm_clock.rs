@@ -301,17 +301,7 @@ mod app {
             gpiob.pb15.into_alternate_push_pull(&mut gpiob.crh),
         );
         let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3500.khz(), clocks);
-        let mut leds = [RGB8::default(); NUM_LEDS];
-
-        for x in 0..16 {
-            for y in 0..8 {
-                leds[leds_xy_to_n(x, y, false)] = hsv2rgb(Hsv {
-                    hue: (x * 255 / 15).try_into().unwrap(),
-                    sat: 255,
-                    val: 3,
-                });
-            }
-        }
+        let leds = [RGB8::default(); NUM_LEDS];
 
         let ws = Ws2812::new(spi);
 
@@ -378,8 +368,14 @@ mod app {
 
         let wdg = IndependentWatchdog::new(c.device.IWDG);
 
-        main_sm::spawn_after(2.secs(), MainEvent::Timeout).unwrap();
-        light::spawn_after(50.millis(), LightEvent::INIT).unwrap();
+        light::spawn(LightEvent::INIT).unwrap();
+        light::spawn(LightEvent::DIGITS {
+            dg: [10, 10, 10, 10, 10, 10],
+            col1: true,
+            col2: true,
+        })
+        .unwrap();
+        light::spawn(LightEvent::ALARM_CHANGE { set: alarm_enabled }).unwrap();
 
         (
             Shared {
@@ -618,7 +614,7 @@ mod app {
     }
 
     #[task(shared = [leds], local = [ws, is_alarm: bool = false, mode: LightTickMode = LightTickMode::DAY],
-                        priority = 16, capacity = 2)]
+                        priority = 16, capacity = 3)]
     fn light(cx: light::Context, ev: LightEvent) {
         let ws = cx.local.ws;
         let mut leds = cx.shared.leds;
@@ -1274,7 +1270,6 @@ mod app {
     }
 
     pub enum MainState {
-        TitleScreen,
         TimeDisplay,
         Sunrise {
             ramp: Peekable<Bresenham>,
@@ -1393,7 +1388,7 @@ mod app {
 
     #[task(shared = [leds, eeprom], local = [
                                  curr_al: usize = 0,
-                                 state: MainState = MainState::TitleScreen,
+                                 state: MainState = MainState::TimeDisplay,
                                  handle: Option<main_sm::SpawnHandle> = None,
                                  handle2: Option<main_sm::SpawnHandle> = None,
                                  rng,
@@ -1412,22 +1407,6 @@ mod app {
         let datetime = cx.local.dt;
 
         match state {
-            MainState::TitleScreen => match ev {
-                MainEvent::Timeout => {
-                    *state = MainState::TimeDisplay;
-                    light::spawn(LightEvent::DIGITS {
-                        dg: [10, 10, 10, 10, 10, 10],
-                        col1: true,
-                        col2: true,
-                    })
-                    .unwrap();
-                    light::spawn(LightEvent::ALARM_CHANGE {
-                        set: *cx.local.alarm_enabled,
-                    })
-                    .unwrap();
-                }
-                _ => (),
-            },
             MainState::TimeDisplay => match ev {
                 MainEvent::PPSTick { dt, gps_lock } => {
                     pps_tick_handler(dt, gps_lock);
