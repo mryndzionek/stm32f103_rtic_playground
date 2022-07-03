@@ -642,6 +642,9 @@ mod app {
                         d -= '0' as u8;
                         leds_draw_digit(leds, x, d, color);
                     }
+                    if *cx.local.is_alarm {
+                        leds[leds_xy_to_n(0, 1, false)] = RGB8::new(0, 0, color.r);
+                    }
                     if s % 2 == 1 {
                         leds_draw_colon(leds, 0, color);
                         leds_draw_colon(leds, 1, color);
