@@ -92,18 +92,19 @@ mod app {
     #[monotonic(binds = SysTick, default = true)]
     type MyMono = DwtSystick<FREQ>;
 
-    const SEG_LEN: usize = (5 * 4) + (2 * 3); // 7 segments, 5 with 4 LEDs, 2 with 3 LEDs
+    const SEG_LEN: usize = (5 * 4) + 5 + 3;
+    const COLON_LEN: usize = 4;
     const NUM_SEGS: usize = 7;
     const BUFF_SIZE: usize = 1024;
     const LED_ROWS: usize = 8;
     const LED_COLS: usize = 16;
-    const NUM_LEDS: usize = SEG_LEN * 6 + (2 * 2);
+    const NUM_LEDS: usize = (SEG_LEN * 6) + (2 * COLON_LEN);
     const UTC_OFFSET: Duration = Duration::HOUR;
     const SUNRISE_LEN: Duration = Duration::minutes(30);
     const ALARM_LEN: Duration = Duration::minutes(3);
     const BUZZER_BASE_FREQ_HZ: u32 = 6000;
     const LED_COLOR_PROJECTOR: RGB8 = RGB8::new(64, 2, 0);
-    const LED_COLOR_DAY: RGB8 = RGB8::new(16, 2, 0);
+    const LED_COLOR_DAY: RGB8 = RGB8::new(160, 0, 0);
     const LED_COLOR_NIGHT: RGB8 = RGB8::new(1, 0, 0);
     const DEFAULT_LAMP_COLOR: Hsv = Hsv {
         hue: 0,
@@ -118,13 +119,13 @@ mod app {
         page_count: 2,
     };
 
-    const SYMBOL_TO_SEGS: [u8; 11] = [
-        0b1111110, 0b1000010, 0b0110111, 0b1100111, 0b1001011, 0b1101101, 0b1111101, 0b1000110,
-        0b1111111, 0b1101111, 0b1011011, // X
+    const SYMBOL_TO_SEGS: [u8; 10] = [
+        0b1111110, 0b0011000, 0b1101101, 0b0111101, 0b0011011, 0b0110111, 0b1110111, 0b0011100,
+        0b1111111, 0b0111111,
     ];
 
     const SEG_TO_OFFSET: [(usize, usize); NUM_SEGS] =
-        [(0, 4), (4, 3), (7, 4), (11, 4), (15, 4), (19, 3), (22, 4)];
+        [(0, 4), (4, 4), (8, 4), (12, 4), (16, 5), (21, 4), (25, 3)];
 
     const SUNRISE_CMAP: [u32; 256] = [
         0x20000, 0x70000, 0xD0000, 0x120000, 0x160000, 0x190000, 0x1C0000, 0x1F0000, 0x220000,
@@ -179,12 +180,21 @@ mod app {
     #[allow(non_camel_case_types)]
     pub enum LightEvent {
         INIT,
-        SOLID_COLOR { color: RGB8 },
-        TICK { h: u8, m: u8, s: u8 },
-        TICK_MODE { mode: LightTickMode },
-        DIGITS { dg: [u8; 6], col1: bool, col2: bool },
+        SOLID_COLOR {
+            color: RGB8,
+        },
+        TICK_MODE {
+            mode: LightTickMode,
+        },
+        DIGITS {
+            dg: Option<[char; 6]>,
+            col1: bool,
+            col2: bool,
+        },
         UPDATE,
-        ALARM_CHANGE { set: bool },
+        ALARM_CHANGE {
+            set: bool,
+        },
     }
 
     #[derive(Debug, PartialEq, Clone)]
@@ -369,13 +379,8 @@ mod app {
         let wdg = IndependentWatchdog::new(c.device.IWDG);
 
         light::spawn(LightEvent::INIT).unwrap();
-        light::spawn(LightEvent::DIGITS {
-            dg: [10, 10, 10, 10, 10, 10],
-            col1: true,
-            col2: true,
-        })
-        .unwrap();
         light::spawn(LightEvent::ALARM_CHANGE { set: alarm_enabled }).unwrap();
+        main_sm::spawn(MainEvent::Timeout).unwrap();
 
         (
             Shared {
@@ -613,6 +618,16 @@ mod app {
         }
     }
 
+    fn char_to_segs(c: char) -> u8 {
+        match c {
+            '0'..='9' => SYMBOL_TO_SEGS[(c as usize) - ('0' as usize)],
+            ' ' => 0b0000000,
+            '-' => 0b0000001,
+            'X' | 'x' => 0b1011011,
+            _ => 0b0000000,
+        }
+    }
+
     #[task(shared = [leds], local = [ws, is_alarm: bool = false, mode: LightTickMode = LightTickMode::DAY],
                         priority = 16, capacity = 3)]
     fn light(cx: light::Context, ev: LightEvent) {
@@ -630,28 +645,6 @@ mod app {
             LightEvent::INIT => leds.lock(|leds| {
                 ws.write(leds.iter().cloned()).unwrap();
             }),
-            LightEvent::TICK { h, m, s } => {
-                let mut buf: String<6> = String::new();
-                buf.write_fmt(format_args!("{:02}{:02}{:02}", h, m, s))
-                    .unwrap();
-
-                leds.lock(|leds| {
-                    *leds = leds.map(|_| RGB8::default());
-
-                    for (x, mut d) in buf.bytes().enumerate() {
-                        d -= '0' as u8;
-                        leds_draw_digit(leds, x, d, color);
-                    }
-                    if *cx.local.is_alarm {
-                        leds[leds_xy_to_n(0, 1, false)] = RGB8::new(0, 0, color.r);
-                    }
-                    if s % 2 == 1 {
-                        leds_draw_colon(leds, 0, color);
-                        leds_draw_colon(leds, 1, color);
-                    }
-                    leds_write(ws, leds);
-                });
-            }
             LightEvent::TICK_MODE { mode } => {
                 *curr_mode = mode;
             }
@@ -678,17 +671,22 @@ mod app {
             }
             LightEvent::DIGITS { dg, col1, col2 } => {
                 leds.lock(|leds| {
-                    *leds = leds.map(|_| RGB8::default());
-
-                    for (x, d) in dg.iter().enumerate() {
-                        leds_draw_digit(leds, x, *d % (SYMBOL_TO_SEGS.len() as u8), color);
+                    if let Some(dg) = dg {
+                        *leds = leds.map(|_| RGB8::default());
+                        for (x, d) in dg.iter().rev().enumerate() {
+                            leds_draw_digit(leds, x, *d, color);
+                        }
                     }
 
                     if col1 {
                         leds_draw_colon(leds, 0, color);
+                    } else {
+                        leds_draw_colon(leds, 0, RGB8::default());
                     }
                     if col2 {
                         leds_draw_colon(leds, 1, color);
+                    } else {
+                        leds_draw_colon(leds, 1, RGB8::default());
                     }
                     leds_write(ws, leds);
                 });
@@ -1164,9 +1162,9 @@ mod app {
         return n + (_y * 8) + (_x % 8);
     }
 
-    fn leds_draw_digit(leds: &mut [RGB8; NUM_LEDS], x: usize, d: u8, color: RGB8) {
-        let dx = x * SEG_LEN + (2 * (x / 2));
-        let segs = SYMBOL_TO_SEGS[d as usize];
+    fn leds_draw_digit(leds: &mut [RGB8; NUM_LEDS], x: usize, d: char, color: RGB8) {
+        let dx = x * SEG_LEN + (COLON_LEN * (x / 2));
+        let segs = char_to_segs(d);
         for i in 0..NUM_SEGS {
             if segs & (1 << i) != 0 {
                 let (o, l) = SEG_TO_OFFSET[i];
@@ -1178,9 +1176,10 @@ mod app {
     }
 
     fn leds_draw_colon(leds: &mut [RGB8; NUM_LEDS], x: usize, color: RGB8) {
-        let offset = 2 * SEG_LEN + ((2 * SEG_LEN) + 2) * x;
-        leds[offset] = color;
-        leds[offset + 1] = color;
+        let offset = 2 * SEG_LEN + ((2 * SEG_LEN) + COLON_LEN) * x;
+        for i in offset..offset + COLON_LEN {
+            leds[i] = color;
+        }
     }
 
     #[derive(Debug, PartialEq, Format)]
@@ -1273,6 +1272,9 @@ mod app {
     }
 
     pub enum MainState {
+        NoSync {
+            s: bool,
+        },
         TimeDisplay,
         Sunrise {
             ramp: Peekable<Bresenham>,
@@ -1284,15 +1286,11 @@ mod app {
             hsv: Hsv,
         },
         Fire,
-        Coals {
-            is_rgb: bool,
-        },
     }
 
     #[derive(Debug)]
     pub enum MainEvent {
         Timeout,
-        Timeout2,
         PPSTick {
             dt: Option<PrimitiveDateTime>,
             gps_lock: bool,
@@ -1353,45 +1351,23 @@ mod app {
         }
     }
 
-    fn diff_skewed(a: u16, b: u16) -> u16 {
-        if a > b {
-            return a - b;
-        } else {
-            return 0;
-        };
-    }
-
-    fn coals_transfer(pixels: &[[u16; LED_COLS + 2]; LED_ROWS + 2], x: u8, y: u8) -> u16 {
-        let mut v: u32 = 0;
-
-        for i in [-1, 0, 1] {
-            for j in [-1, 0, 1] {
-                let n = (y as i16 + i) as usize;
-                let m = (x as i16 + j) as usize;
-                v += diff_skewed(pixels[m][n], pixels[x as usize][y as usize]) as u32;
-            }
-        }
-
-        return if v > 0xFFFF { 0xFFFF } else { v as u16 };
-    }
-
-    fn coals_update(pixels: &mut [[u16; LED_COLS + 2]; LED_ROWS + 2]) {
-        for x in 1..LED_ROWS + 1 {
-            for y in 1..LED_COLS + 1 {
-                pixels[x][y] =
-                    diff_skewed(pixels[x][y], 32) + (coals_transfer(&pixels, x as u8, y as u8) / 8);
-            }
-        }
-    }
-
     fn disp_time(time: Time) {
         let (h, m, s) = time.as_hms();
-        light::spawn(LightEvent::TICK { h, m, s }).unwrap();
+        let mut buf: String<6> = String::new();
+        buf.write_fmt(format_args!("{:02}{:02}{:02}", h, m, s))
+            .unwrap();
+        let dg = buf.chars().collect::<Vec<_, 6>>().into_array().unwrap();
+        light::spawn(LightEvent::DIGITS {
+            dg: Some(dg),
+            col1: true,
+            col2: true,
+        })
+        .unwrap();
     }
 
     #[task(shared = [leds, eeprom], local = [
                                  curr_al: usize = 0,
-                                 state: MainState = MainState::TimeDisplay,
+                                 state: MainState = MainState::NoSync {s: false},
                                  handle: Option<main_sm::SpawnHandle> = None,
                                  handle2: Option<main_sm::SpawnHandle> = None,
                                  rng,
@@ -1410,6 +1386,33 @@ mod app {
         let datetime = cx.local.dt;
 
         match state {
+            MainState::NoSync { s } => match ev {
+                MainEvent::Timeout => {
+                    if *s {
+                        light::spawn(LightEvent::DIGITS {
+                            dg: Some(['X'; 6]),
+                            col1: true,
+                            col2: true,
+                        })
+                        .unwrap();
+                        *state = MainState::NoSync { s: false };
+                    } else {
+                        light::spawn(LightEvent::DIGITS {
+                            dg: Some([' '; 6]),
+                            col1: false,
+                            col2: false,
+                        })
+                        .unwrap();
+                        *state = MainState::NoSync { s: true };
+                    }
+                    main_sm::spawn_after(1000.millis(), MainEvent::Timeout).unwrap();
+                }
+                MainEvent::PPSTick { dt: _, gps_lock: _ } => {
+                    *state = MainState::TimeDisplay;
+                    main_sm::spawn(ev).unwrap();
+                }
+                _ => (),
+            },
             MainState::TimeDisplay => match ev {
                 MainEvent::PPSTick { dt, gps_lock } => {
                     pps_tick_handler(dt, gps_lock);
@@ -1461,9 +1464,22 @@ mod app {
                             LightTickMode::PROJECTOR => {}
                         }
                         disp_time(dt.time());
+                        *cx.local.handle =
+                            main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
                     }
                 }
+                MainEvent::Timeout => {
+                    light::spawn(LightEvent::DIGITS {
+                        dg: None,
+                        col1: false,
+                        col2: false,
+                    })
+                    .unwrap();
+                }
                 MainEvent::LongButtonPress => {
+                    if let Some(handle) = cx.local.handle.take() {
+                        handle.cancel().ok();
+                    }
                     disp_time(*alarm_time);
                     buzzer::spawn(BuzzerEvent::Alarm {
                         i: Some(*cx.local.curr_al),
@@ -1707,94 +1723,7 @@ mod app {
                                 bmp[i][j] = 0;
                             }
                         }
-                        *state = MainState::Coals { is_rgb: false };
-                        main_sm::spawn(MainEvent::Timeout).unwrap();
-                        main_sm::spawn(MainEvent::Timeout2).unwrap();
-                    }
-                    _ => (),
-                }
-            }
-            MainState::Coals { is_rgb } => {
-                let mut leds = cx.shared.leds;
-                let bmp = cx.local.bmp;
-                let rng = cx.local.rng;
-
-                match ev {
-                    MainEvent::PPSTick { dt, gps_lock } => {
-                        *datetime = dt;
-                        pps_tick_handler(dt, gps_lock);
-                    }
-                    MainEvent::Timeout => {
-                        coals_update(bmp);
-
-                        leds.lock(|leds| {
-                            for i in 1..LED_ROWS + 1 {
-                                for j in 1..LED_COLS + 1 {
-                                    let v = if bmp[i][j] > 0xFF { 0xFF } else { bmp[i][j] };
-                                    let c = if *is_rgb {
-                                        if v == 0 {
-                                            RGB8::default()
-                                        } else {
-                                            hsv2rgb(Hsv {
-                                                hue: v.try_into().unwrap(),
-                                                sat: 255,
-                                                val: v.try_into().unwrap(),
-                                            })
-                                        }
-                                    } else {
-                                        let rgb = SUNRISE_CMAP
-                                            [TryInto::<usize>::try_into(v).unwrap()]
-                                        .to_be_bytes()[1..4]
-                                            .iter()
-                                            .map(|v| GAMMA8[*v as usize])
-                                            .collect::<Vec<_, 3>>();
-                                        RGB8::new(rgb[0], rgb[1], rgb[2]) / 2
-                                    };
-
-                                    leds[leds_xy_to_n(
-                                        j - 1,
-                                        LED_ROWS - i,
-                                        *curr_mode == LightTickMode::PROJECTOR,
-                                    )] = c;
-                                }
-                            }
-                        });
-
-                        light::spawn(LightEvent::UPDATE).unwrap();
-                        *cx.local.handle =
-                            main_sm::spawn_after(30.millis(), MainEvent::Timeout).ok();
-                    }
-                    MainEvent::Timeout2 => {
-                        let x = rng.rand_range(1..(LED_COLS + 1) as u32) as usize;
-                        let y = rng.rand_range(1..(LED_ROWS + 1) as u32) as usize;
-
-                        if bmp[y][x] <= 0x1FF {
-                            bmp[y][x] += rng.rand_range(0x300..0x3FF) as u16;
-                        }
-
-                        let tm = rng.rand_range(200..1300);
-                        *cx.local.handle2 =
-                            main_sm::spawn_after(tm.millis(), MainEvent::Timeout2).ok();
-                    }
-                    MainEvent::ShortButtonPress => *state = MainState::Coals { is_rgb: !*is_rgb },
-                    MainEvent::LongButtonPress => {
-                        if let Some(handle) = cx.local.handle.take() {
-                            handle.cancel().ok();
-                        }
-                        if let Some(handle2) = cx.local.handle2.take() {
-                            handle2.cancel().ok();
-                        }
                         *state = MainState::TimeDisplay;
-                        if let Some(dt) = *datetime {
-                            disp_time(dt.time());
-                        } else {
-                            light::spawn(LightEvent::DIGITS {
-                                dg: [10, 10, 10, 10, 10, 10],
-                                col1: true,
-                                col2: true,
-                            })
-                            .unwrap();
-                        }
                     }
                     _ => (),
                 }
