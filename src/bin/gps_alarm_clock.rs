@@ -608,8 +608,32 @@ mod app {
             '0'..='9' => SYMBOL_TO_SEGS[(c as usize) - ('0' as usize)],
             ' ' => 0b0000000,
             '-' => 0b0000001,
-            'X' | 'x' => 0b1011011,
-            _ => 0b0000000,
+            'A' => 0b1011111,
+            'b' => 0b1110011,
+            'c' => 0b1100001,
+            'd' => 0b1111001,
+            'E' => 0b1100111,
+            'F' => 0b1000111,
+            'G' => 0b1110110,
+            'h' => 0b1010011,
+            'I' => 0b0011000,
+            'J' => 0b1111000,
+            'K' => 0b1011011,
+            'L' => 0b1100010,
+            'm' => 0b1010100,
+            'n' => 0b1010001,
+            'o' => 0b1110001,
+            'P' => 0b1001111,
+            'q' => 0b0011111,
+            'r' => 0b1000001,
+            'S' => 0b0110111,
+            't' => 0b1100011,
+            'U' => 0b1111010,
+            'w' => 0b0101010,
+            'X' => 0b1011011,
+            'y' => 0b0111011,
+            'Z' => 0b1101101,
+            _ => 0b0010111,
         }
     }
 
@@ -1251,10 +1275,10 @@ mod app {
         },
     }
 
-    fn pps_tick_handler(dt: Option<PrimitiveDateTime>, _gps_lock: bool) {
+    fn pps_tick_handler(dt: Option<PrimitiveDateTime>, mode: &mut LightTickMode) {
         if let Some(dt) = dt {
-            let (h, s) = (dt.time().hour(), dt.time().second());
-            if h < 22 && h > 7 {
+            let s = dt.time().second();
+            if *mode == LightTickMode::DAY {
                 match dt.time().minute() {
                     0 => {
                         if s == 0 {
@@ -1274,6 +1298,20 @@ mod app {
                     _ => (),
                 }
             }
+
+            let h = dt.time().hour();
+            match *mode {
+                LightTickMode::DAY => {
+                    if h > 21 || h < 7 {
+                        *mode = LightTickMode::NIGHT;
+                    }
+                }
+                LightTickMode::NIGHT => {
+                    if h <= 21 && h >= 7 {
+                        *mode = LightTickMode::DAY;
+                    }
+                }
+            }
         }
     }
 
@@ -1282,7 +1320,10 @@ mod app {
         let mut buf: String<6> = String::new();
         buf.write_fmt(format_args!("{:02}{:02}{:02}", h, m, s))
             .unwrap();
-        let dg = buf.chars().collect::<Vec<_, 6>>().into_array().unwrap();
+        let mut dg = str_to_array(&buf);
+        if dg[0] == '0' {
+            dg[0] = ' ';
+        }
         let mut color = hsv2rgb(color);
         if mode == LightTickMode::NIGHT {
             color = color
@@ -1297,6 +1338,10 @@ mod app {
             color: color,
         })
         .unwrap();
+    }
+
+    fn str_to_array<const N: usize>(str: &str) -> [char; N] {
+        str.chars().collect::<Vec<_, N>>().into_array().unwrap()
     }
 
     #[task(shared = [eeprom], local = [
@@ -1325,9 +1370,9 @@ mod app {
                 MainEvent::Timeout => {
                     if *s {
                         light::spawn(LightEvent::DIGITS {
-                            dg: Some(['X'; 6]),
-                            col1: true,
-                            col2: true,
+                            dg: Some(str_to_array("noLocK")),
+                            col1: false,
+                            col2: false,
                             color: hsv2rgb(*color),
                         })
                         .unwrap();
@@ -1351,8 +1396,8 @@ mod app {
                 _ => (),
             },
             MainState::TimeDisplay => match ev {
-                MainEvent::PPSTick { dt, gps_lock } => {
-                    pps_tick_handler(dt, gps_lock);
+                MainEvent::PPSTick { dt, gps_lock: _ } => {
+                    pps_tick_handler(dt, curr_mode);
                     *datetime = dt;
                     if let Some(dt) = *datetime {
                         if *cx.local.alarm_enabled {
@@ -1377,20 +1422,7 @@ mod app {
                                 }
                             }
                         }
-                        let h = dt.time().hour();
 
-                        match *curr_mode {
-                            LightTickMode::DAY => {
-                                if h > 21 || h < 7 {
-                                    *curr_mode = LightTickMode::NIGHT;
-                                }
-                            }
-                            LightTickMode::NIGHT => {
-                                if h <= 21 && h >= 7 {
-                                    *curr_mode = LightTickMode::DAY;
-                                }
-                            }
-                        }
                         disp_time(dt.time(), *color, curr_mode.clone());
                         *cx.local.handle =
                             main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
@@ -1429,8 +1461,8 @@ mod app {
                 _ => (),
             },
             MainState::Sunrise { ramp, prev_val } => match ev {
-                MainEvent::PPSTick { dt, gps_lock } => {
-                    pps_tick_handler(dt, gps_lock);
+                MainEvent::PPSTick { dt, gps_lock: _ } => {
+                    pps_tick_handler(dt, curr_mode);
                     *datetime = dt;
                     let v;
                     loop {
@@ -1546,10 +1578,11 @@ mod app {
             },
             MainState::ColorSetting => {
                 match ev {
-                    MainEvent::PPSTick { dt, gps_lock } => {
+                    MainEvent::PPSTick { dt, gps_lock: _ } => {
                         *datetime = dt;
-                        pps_tick_handler(dt, gps_lock);
-                        *cx.local.handle = main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
+                        pps_tick_handler(dt, curr_mode);
+                        *cx.local.handle =
+                            main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
                     }
                     MainEvent::Timeout => {
                         light::spawn(LightEvent::DIGITS {
