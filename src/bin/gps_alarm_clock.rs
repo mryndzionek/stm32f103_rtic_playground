@@ -98,6 +98,9 @@ mod app {
     const LED_ROWS: usize = 8;
     const LED_COLS: usize = 16;
     const NUM_LEDS: usize = (SEG_LEN * 6) + (2 * COLON_LEN);
+    const LED_FADE_MAX: u8 = 100;
+    const LED_FADE_SLOPE: usize = 10;
+    const LED_FADE_SPEED: u32 = 10;
     const UTC_OFFSET: Duration = Duration::HOUR;
     const SUNRISE_LEN: Duration = Duration::minutes(30);
     const ALARM_LEN: Duration = Duration::minutes(3);
@@ -182,6 +185,7 @@ mod app {
             col2: bool,
             color: RGB8,
         },
+        TIMEOUT,
     }
 
     #[derive(Debug, PartialEq, Clone)]
@@ -189,6 +193,12 @@ mod app {
     pub enum LightTickMode {
         DAY,
         NIGHT,
+    }
+
+    #[derive(Debug, PartialEq, Clone, Copy)]
+    pub enum LightTransition {
+        InProgress { brightness: i16, slope: i16 },
+        Finished { state: bool },
     }
 
     #[shared]
@@ -637,11 +647,56 @@ mod app {
         }
     }
 
-    #[task(shared = [leds], local = [ws],
+    fn update_transition(t: LightTransition) -> LightTransition {
+        match t {
+            LightTransition::InProgress { brightness, slope } => {
+                let nv: u8 = (brightness + slope).try_into().unwrap();
+                if nv == 0 || nv == LED_FADE_MAX {
+                    LightTransition::Finished {
+                        state: nv == LED_FADE_MAX,
+                    }
+                } else {
+                    LightTransition::InProgress {
+                        brightness: nv.try_into().unwrap(),
+                        slope: slope,
+                    }
+                }
+            }
+            LightTransition::Finished { state: _ } => t,
+        }
+    }
+
+    fn transition_to_brightness(t: LightTransition) -> u8 {
+        match t {
+            LightTransition::InProgress {
+                brightness,
+                slope: _,
+            } => brightness.try_into().unwrap(),
+            LightTransition::Finished { state } => {
+                if state {
+                    LED_FADE_MAX
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    #[task(shared = [leds], local = [ws, is_trans: bool = false,
+                                     prev_dg: [char; 6] = [' '; 6],
+                                     trans_state: [[LightTransition; NUM_SEGS]; 6] = [[LightTransition::Finished {state: false}; NUM_SEGS]; 6],
+
+                                     curr_color: RGB8 = RGB8::new(0, 0, 0),
+                                     handle: Option<light::SpawnHandle> = None],
                         priority = 16, capacity = 3)]
     fn light(cx: light::Context, ev: LightEvent) {
         let ws = cx.local.ws;
         let mut leds = cx.shared.leds;
+        let is_trans = cx.local.is_trans;
+        let prev_dg = cx.local.prev_dg;
+        let trans_state = cx.local.trans_state;
+        let handle = cx.local.handle;
+        let curr_color = cx.local.curr_color;
 
         match ev {
             LightEvent::INIT => leds.lock(|leds| {
@@ -653,25 +708,79 @@ mod app {
                 col2,
                 color,
             } => {
-                leds.lock(|leds| {
-                    if let Some(dg) = dg {
-                        *leds = leds.map(|_| RGB8::default());
-                        for (x, d) in dg.iter().rev().enumerate() {
-                            leds_draw_digit(leds, x, *d, color);
+                if *is_trans {
+                    if let Some(handle) = handle.take() {
+                        handle.cancel().ok();
+                    }
+                }
+                if let Some(dg) = dg {
+                    for (i, (d, pd)) in dg.iter().zip((*prev_dg).iter()).enumerate() {
+                        let (sd, psd) = (char_to_segs(*d), char_to_segs(*pd));
+                        for j in 0..NUM_SEGS {
+                            if (sd & (1 << j)) != (psd & (1 << j)) {
+                                if (sd & (1 << j)) != 0 {
+                                    trans_state[i][j] = LightTransition::InProgress {
+                                        brightness: 0,
+                                        slope: LED_FADE_SLOPE.try_into().unwrap(),
+                                    };
+                                } else {
+                                    trans_state[i][j] = LightTransition::InProgress {
+                                        brightness: LED_FADE_MAX.try_into().unwrap(),
+                                        slope: -TryInto::<i16>::try_into(LED_FADE_SLOPE).unwrap(),
+                                    };
+                                }
+                            } else {
+                                trans_state[i][j] = LightTransition::Finished {
+                                    state: (sd & (1 << j)) != 0,
+                                }
+                            }
                         }
                     }
-
+                    *is_trans = true;
+                    *curr_color = color;
+                    *prev_dg = dg;
+                    defmt::info!("Transition started");
+                    *handle = light::spawn_after(LED_FADE_SPEED.millis(), LightEvent::TIMEOUT).ok();
+                }
+                leds.lock(|leds| {
                     if col1 {
-                        leds_draw_colon(leds, 0, color);
+                        leds_draw_colon(leds, 0, LED_FADE_MAX, color);
                     } else {
-                        leds_draw_colon(leds, 0, RGB8::default());
+                        leds_draw_colon(leds, 0, 0, RGB8::default());
                     }
                     if col2 {
-                        leds_draw_colon(leds, 1, color);
+                        leds_draw_colon(leds, 1, LED_FADE_MAX, color);
                     } else {
-                        leds_draw_colon(leds, 1, RGB8::default());
+                        leds_draw_colon(leds, 1, 0, RGB8::default());
                     }
                     leds_write(ws, leds);
+                });
+            }
+            LightEvent::TIMEOUT => {
+                defmt::info!("Transition timeout");
+                for d in (*trans_state).iter_mut() {
+                    for s in d.iter_mut() {
+                        *s = update_transition(*s);
+                    }
+                }
+
+                leds.lock(|leds| {
+                    for (x, d) in (*trans_state).iter().rev().enumerate() {
+                        let segs: [u8; NUM_SEGS] = d.map(transition_to_brightness);
+                        leds_draw_digit(leds, x, segs, *curr_color);
+                    }
+                    leds_write(ws, leds);
+
+                    if !(*trans_state).iter().all(|x| {
+                        x.iter()
+                            .all(|y| matches!(y, LightTransition::Finished { .. }))
+                    }) {
+                        *handle =
+                            light::spawn_after(LED_FADE_SPEED.millis(), LightEvent::TIMEOUT).ok();
+                    } else {
+                        *is_trans = false;
+                        defmt::info!("Transition finished");
+                    }
                 });
             }
         }
@@ -1138,23 +1247,30 @@ mod app {
         }
     }
 
-    fn leds_draw_digit(leds: &mut [RGB8; NUM_LEDS], x: usize, d: char, color: RGB8) {
+    fn dim_color(c: RGB8, b: u8) -> RGB8 {
+        c.iter()
+            .map(|v| {
+                (((v as usize) * (b as usize)) / LED_FADE_MAX as usize)
+                    .try_into()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn leds_draw_digit(leds: &mut [RGB8; NUM_LEDS], x: usize, segs: [u8; NUM_SEGS], color: RGB8) {
         let dx = x * SEG_LEN + (COLON_LEN * (x / 2));
-        let segs = char_to_segs(d);
-        for i in 0..NUM_SEGS {
-            if segs & (1 << i) != 0 {
-                let (o, l) = SEG_TO_OFFSET[i];
-                for i in dx + o..dx + o + l {
-                    leds[i] = color;
-                }
+        for (i, s) in segs.iter().enumerate() {
+            let (o, l) = SEG_TO_OFFSET[i];
+            for i in dx + o..dx + o + l {
+                leds[i] = dim_color(color, *s);
             }
         }
     }
 
-    fn leds_draw_colon(leds: &mut [RGB8; NUM_LEDS], x: usize, color: RGB8) {
+    fn leds_draw_colon(leds: &mut [RGB8; NUM_LEDS], x: usize, b: u8, color: RGB8) {
         let offset = 2 * SEG_LEN + ((2 * SEG_LEN) + COLON_LEN) * x;
         for i in offset..offset + COLON_LEN {
-            leds[i] = color;
+            leds[i] = dim_color(color, b);
         }
     }
 
@@ -1370,7 +1486,7 @@ mod app {
                 MainEvent::Timeout => {
                     if *s {
                         light::spawn(LightEvent::DIGITS {
-                            dg: Some(str_to_array("noLocK")),
+                            dg: Some(str_to_array("noSync")),
                             col1: false,
                             col2: false,
                             color: hsv2rgb(*color),
@@ -1387,9 +1503,12 @@ mod app {
                         .unwrap();
                         *state = MainState::NoSync { s: true };
                     }
-                    main_sm::spawn_after(1000.millis(), MainEvent::Timeout).unwrap();
+                    *cx.local.handle = main_sm::spawn_after(1000.millis(), MainEvent::Timeout).ok();
                 }
                 MainEvent::PPSTick { dt: _, gps_lock: _ } => {
+                    if let Some(handle) = cx.local.handle.take() {
+                        handle.cancel().ok();
+                    }
                     *state = MainState::TimeDisplay;
                     main_sm::spawn(ev).unwrap();
                 }
