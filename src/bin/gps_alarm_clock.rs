@@ -87,6 +87,20 @@ mod app {
         }
     }
 
+    struct SerialErrorWrapper(stm32f1xx_hal::serial::Error);
+    impl Format for SerialErrorWrapper {
+        fn format(&self, fmt: Formatter) {
+            let s = match self.0 {
+                stm32f1xx_hal::serial::Error::Framing => "Framing error",
+                stm32f1xx_hal::serial::Error::Noise => "Noise error",
+                stm32f1xx_hal::serial::Error::Overrun => "Overrun error",
+                stm32f1xx_hal::serial::Error::Parity => "Parity error",
+                _ => "Unknown error",
+            };
+            write!(fmt, "{}", s);
+        }
+    }
+
     const FREQ: u32 = 72_000_000;
     #[monotonic(binds = SysTick, default = true)]
     type MyMono = DwtSystick<FREQ>;
@@ -94,7 +108,7 @@ mod app {
     const SEG_LEN: usize = (5 * 4) + 5 + 3;
     const COLON_LEN: usize = 4;
     const NUM_SEGS: usize = 7;
-    const BUFF_SIZE: usize = 1024;
+    const BUFF_SIZE: usize = 512;
     const LED_ROWS: usize = 8;
     const LED_COLS: usize = 16;
     const NUM_LEDS: usize = (SEG_LEN * 6) + (2 * COLON_LEN);
@@ -108,7 +122,7 @@ mod app {
     const LED_COLOR_DAY: Hsv = Hsv {
         hue: 0,
         sat: 255,
-        val: 160,
+        val: 140,
     };
 
     const EEPROM_PARAMS: Params = Params {
@@ -178,7 +192,6 @@ mod app {
     #[derive(Debug)]
     #[allow(non_camel_case_types)]
     pub enum LightEvent {
-        INIT,
         DIGITS {
             dg: Option<[char; 6]>,
             col1: bool,
@@ -209,7 +222,6 @@ mod app {
         eeprom: EEPROM<&'static mut stm32f1xx_hal::flash::Parts>,
         btn_pin: PA4<Input<PullUp>>,
         exti: EXTI,
-        leds: [RGB8; NUM_LEDS],
     }
 
     type Leds = ws2812_spi::Ws2812<
@@ -242,6 +254,7 @@ mod app {
         rng: Rand32,
         alarm_enabled: bool,
         alarm_time: Time,
+        leds: [RGB8; NUM_LEDS],
     }
 
     #[init(local = [flash: Option<Parts> = None])]
@@ -283,7 +296,7 @@ mod app {
             c.device.USART2,
             (tx, rx),
             &mut afio.mapr,
-            Config::default().baudrate(38400.bps()),
+            Config::default().baudrate(19200.bps()),
             clocks,
         )
         .split();
@@ -306,10 +319,10 @@ mod app {
             NoMiso,
             gpiob.pb15.into_alternate_push_pull(&mut gpiob.crh),
         );
-        let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3500.khz(), clocks);
+        let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3800.khz(), clocks);
         let leds = [RGB8::default(); NUM_LEDS];
 
-        let ws = Ws2812::new(spi);
+        let mut ws = Ws2812::new(spi);
 
         let mut dcb = c.core.DCB;
         let dwt = c.core.DWT;
@@ -358,7 +371,7 @@ mod app {
         .unwrap();
 
         let buzz_pin = gpioa.pa6.into_alternate_push_pull(&mut gpioa.crl);
-        let mut buzz_pwm = Timer::new(c.device.TIM3, &clocks).pwm::<Tim3NoRemap, _, _, _>(
+        let mut buzz_pwm = Timer::tim3(c.device.TIM3, &clocks).pwm::<Tim3NoRemap, _, _, _>(
             buzz_pin,
             &mut afio.mapr,
             BUZZER_BASE_FREQ_HZ.hz(),
@@ -374,7 +387,7 @@ mod app {
 
         let wdg = IndependentWatchdog::new(c.device.IWDG);
 
-        light::spawn(LightEvent::INIT).unwrap();
+        leds_write(&mut ws, &leds);
         main_sm::spawn(MainEvent::Timeout).unwrap();
 
         (
@@ -385,7 +398,6 @@ mod app {
                 eeprom,
                 btn_pin: btn,
                 exti: c.device.EXTI,
-                leds,
             },
             Local {
                 led,
@@ -403,25 +415,29 @@ mod app {
                 rng: Rand32::new(666),
                 alarm_enabled,
                 alarm_time,
+                leds,
             },
             init::Monotonics(mono),
         )
     }
 
-    #[task(binds = USART2, shared = [], local = [rx, prod], priority = 16)]
+    #[task(binds = USART2, shared = [], local = [rx, prod], priority = 8)]
     fn usart2(cx: usart2::Context) {
         let rx = cx.local.rx;
         let prod = cx.local.prod;
         if rx.is_rx_not_empty() {
-            if let Ok(b) = nb::block!(rx.read()) {
-                let mut wgr = prod.grant_exact(1).unwrap();
-                wgr[0] = b;
-                wgr.commit(1);
-                if b == '\n' as u8 {
-                    parse::spawn().ok();
+            match nb::block!(rx.read()) {
+                Ok(b) => {
+                    let mut wgr = prod.grant_exact(1).unwrap();
+                    wgr[0] = b;
+                    wgr.commit(1);
+                    if b == '\n' as u8 {
+                        parse::spawn().ok();
+                    }
                 }
-            } else {
-                defmt::error!("usart error!!!");
+                Err(e) => {
+                    defmt::error!("usart error!!! {}", SerialErrorWrapper(e));
+                }
             }
             rx.listen_idle();
         } else if rx.is_idle() {
@@ -534,10 +550,10 @@ mod app {
                         );
                     }
                     Ok(_) => {
-                        defmt::debug!("Incomplete NMEA")
+                        defmt::warn!("Incomplete NMEA")
                     }
                     Err(e) => {
-                        defmt::debug!("NMEA parsing error: {}", e)
+                        defmt::warn!("NMEA parsing error: {}", e)
                     }
                 }
             }
@@ -598,19 +614,7 @@ mod app {
     }
 
     fn leds_write(ws: &mut Leds, leds: &[RGB<u8>; NUM_LEDS]) {
-        for retries in 0..10 {
-            let ret = ws.write(leds.iter().cloned());
-            match ret {
-                Ok(_) => break,
-                Err(_) => {
-                    if retries == 9 {
-                        defmt::panic!();
-                    } else {
-                        defmt::warn!("Writing to LEDs failed")
-                    }
-                }
-            }
-        }
+        ws.write(leds.iter().cloned()).unwrap();
     }
 
     fn char_to_segs(c: char) -> u8 {
@@ -682,16 +686,15 @@ mod app {
         }
     }
 
-    #[task(shared = [leds], local = [ws, is_trans: bool = false,
-                                     prev_dg: [char; 6] = [' '; 6],
-                                     trans_state: [[LightTransition; NUM_SEGS]; 6] = [[LightTransition::Finished {state: false}; NUM_SEGS]; 6],
-
-                                     curr_color: RGB8 = RGB8::new(0, 0, 0),
-                                     handle: Option<light::SpawnHandle> = None],
+    #[task(local = [ws, leds, is_trans: bool = false,
+                    prev_dg: [char; 6] = [' '; 6],
+                    trans_state: [[LightTransition; NUM_SEGS]; 6] = [[LightTransition::Finished {state: false}; NUM_SEGS]; 6],
+                    curr_color: RGB8 = RGB8::new(0, 0, 0),
+                    handle: Option<light::SpawnHandle> = None],
                         priority = 16, capacity = 3)]
     fn light(cx: light::Context, ev: LightEvent) {
         let ws = cx.local.ws;
-        let mut leds = cx.shared.leds;
+        let leds = cx.local.leds;
         let is_trans = cx.local.is_trans;
         let prev_dg = cx.local.prev_dg;
         let trans_state = cx.local.trans_state;
@@ -699,9 +702,6 @@ mod app {
         let curr_color = cx.local.curr_color;
 
         match ev {
-            LightEvent::INIT => leds.lock(|leds| {
-                ws.write(leds.iter().cloned()).unwrap();
-            }),
             LightEvent::DIGITS {
                 dg,
                 col1,
@@ -742,46 +742,41 @@ mod app {
                     defmt::info!("Transition started");
                     *handle = light::spawn_after(LED_FADE_SPEED.millis(), LightEvent::TIMEOUT).ok();
                 }
-                leds.lock(|leds| {
-                    if col1 {
-                        leds_draw_colon(leds, 0, LED_FADE_MAX, color);
-                    } else {
-                        leds_draw_colon(leds, 0, 0, RGB8::default());
-                    }
-                    if col2 {
-                        leds_draw_colon(leds, 1, LED_FADE_MAX, color);
-                    } else {
-                        leds_draw_colon(leds, 1, 0, RGB8::default());
-                    }
-                    leds_write(ws, leds);
-                });
+                if col1 {
+                    leds_draw_colon(leds, 0, LED_FADE_MAX, color);
+                } else {
+                    leds_draw_colon(leds, 0, 0, RGB8::default());
+                }
+                if col2 {
+                    leds_draw_colon(leds, 1, LED_FADE_MAX, color);
+                } else {
+                    leds_draw_colon(leds, 1, 0, RGB8::default());
+                }
+                leds_write(ws, leds);
             }
             LightEvent::TIMEOUT => {
-                defmt::info!("Transition timeout");
+                defmt::assert!(*is_trans);
                 for d in (*trans_state).iter_mut() {
                     for s in d.iter_mut() {
                         *s = update_transition(*s);
                     }
                 }
 
-                leds.lock(|leds| {
-                    for (x, d) in (*trans_state).iter().rev().enumerate() {
-                        let segs: [u8; NUM_SEGS] = d.map(transition_to_brightness);
-                        leds_draw_digit(leds, x, segs, *curr_color);
-                    }
-                    leds_write(ws, leds);
+                for (x, d) in (*trans_state).iter().rev().enumerate() {
+                    let segs: [u8; NUM_SEGS] = d.map(transition_to_brightness);
+                    leds_draw_digit(leds, x, segs, *curr_color);
+                }
+                leds_write(ws, leds);
 
-                    if !(*trans_state).iter().all(|x| {
-                        x.iter()
-                            .all(|y| matches!(y, LightTransition::Finished { .. }))
-                    }) {
-                        *handle =
-                            light::spawn_after(LED_FADE_SPEED.millis(), LightEvent::TIMEOUT).ok();
-                    } else {
-                        *is_trans = false;
-                        defmt::info!("Transition finished");
-                    }
-                });
+                if !(*trans_state).iter().all(|x| {
+                    x.iter()
+                        .all(|y| matches!(y, LightTransition::Finished { .. }))
+                }) {
+                    *handle = light::spawn_after(LED_FADE_SPEED.millis(), LightEvent::TIMEOUT).ok();
+                } else {
+                    *is_trans = false;
+                    defmt::info!("Transition finished");
+                }
             }
         }
     }
@@ -1444,7 +1439,7 @@ mod app {
         if mode == LightTickMode::NIGHT {
             color = color
                 .iter()
-                .map(|v| ((v as usize) * (GAMMA8[60] as usize) / 255) as u8)
+                .map(|v| ((v as usize) * (GAMMA8[100] as usize) / 255) as u8)
                 .collect();
         }
         light::spawn(LightEvent::DIGITS {
@@ -1503,14 +1498,16 @@ mod app {
                         .unwrap();
                         *state = MainState::NoSync { s: true };
                     }
-                    *cx.local.handle = main_sm::spawn_after(1000.millis(), MainEvent::Timeout).ok();
+                    *cx.local.handle = main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
                 }
-                MainEvent::PPSTick { dt: _, gps_lock: _ } => {
-                    if let Some(handle) = cx.local.handle.take() {
-                        handle.cancel().ok();
+                MainEvent::PPSTick { dt, gps_lock: _ } => {
+                    if dt.is_some() {
+                        if let Some(handle) = cx.local.handle.take() {
+                            handle.cancel().ok();
+                        }
+                        *state = MainState::TimeDisplay;
+                        main_sm::spawn(ev).unwrap();
                     }
-                    *state = MainState::TimeDisplay;
-                    main_sm::spawn(ev).unwrap();
                 }
                 _ => (),
             },
