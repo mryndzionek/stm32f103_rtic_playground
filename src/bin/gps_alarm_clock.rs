@@ -22,7 +22,7 @@ mod app {
     use rtic::Monotonic;
     use smart_leds::{
         hsv::{hsv2rgb, Hsv},
-        SmartLedsWrite, RGB, RGB8,
+        RGB8,
     };
     use stm32f103_rtic_playground as _;
     use stm32f1xx_hal::gpio::{
@@ -33,18 +33,17 @@ mod app {
     };
     use stm32f1xx_hal::watchdog::IndependentWatchdog;
     use stm32f1xx_hal::{
+        dma::{Transfer, TxDma},
         flash::{FlashSize, Parts, SectorSize},
         pac::{EXTI, TIM2, TIM3},
         prelude::*,
         pwm::{Channel, Pwm, C1},
         serial::{Config, Rx2, Serial},
-        spi::{NoMiso, NoSck, Spi, Spi2NoRemap},
+        spi::{Mode, NoMiso, NoSck, Phase, Polarity, Spi, Spi2NoRemap},
         timer::{CountDownTimer, Event, Tim3NoRemap, Timer},
     };
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
-    use ws2812::Ws2812;
-    use ws2812_spi as ws2812;
 
     struct HemisphereWrapper(Hemisphere);
     impl Format for HemisphereWrapper {
@@ -112,9 +111,10 @@ mod app {
     const LED_ROWS: usize = 8;
     const LED_COLS: usize = 16;
     const NUM_LEDS: usize = (SEG_LEN * 6) + (2 * COLON_LEN);
-    const LED_FADE_MAX: u8 = 100;
-    const LED_FADE_SLOPE: usize = 10;
-    const LED_FADE_SPEED: u32 = 10;
+    const LEDS_BUF_SIZE: usize = 2 * 2048;
+    const LED_FADE_MAX: u8 = 150;
+    const LED_FADE_SLOPE: usize = 5;
+    const LED_FADE_SPEED: u32 = 5;
     const UTC_OFFSET: Duration = Duration::HOUR;
     const SUNRISE_LEN: Duration = Duration::minutes(30);
     const ALARM_LEN: Duration = Duration::minutes(3);
@@ -122,7 +122,7 @@ mod app {
     const LED_COLOR_DAY: Hsv = Hsv {
         hue: 0,
         sat: 255,
-        val: 140,
+        val: 255,
     };
 
     const EEPROM_PARAMS: Params = Params {
@@ -187,8 +187,6 @@ mod app {
         247, 249, 252, 255,
     ];
 
-    static BB: BBBuffer<BUFF_SIZE> = BBBuffer::new();
-
     #[derive(Debug)]
     #[allow(non_camel_case_types)]
     pub enum LightEvent {
@@ -224,7 +222,7 @@ mod app {
         exti: EXTI,
     }
 
-    type Leds = ws2812_spi::Ws2812<
+    type Leds = TxDma<
         Spi<
             stm32f1xx_hal::pac::SPI2,
             Spi2NoRemap,
@@ -235,7 +233,10 @@ mod app {
             ),
             u8,
         >,
+        stm32f1xx_hal::dma::dma1::C5,
     >;
+
+    type Xfer = Transfer<stm32f1xx_hal::dma::R, &'static [u8; LEDS_BUF_SIZE], Leds>;
 
     #[local]
     struct Local {
@@ -243,7 +244,7 @@ mod app {
         pps: PA1<Input<PullDown>>,
         rx: Rx2,
         parser: Parser,
-        ws: Leds,
+        ws: Option<Leds>,
         prod: bbqueue::Producer<'static, BUFF_SIZE>,
         cons: bbqueue::Consumer<'static, BUFF_SIZE>,
         dst: Duration,
@@ -257,7 +258,8 @@ mod app {
         leds: [RGB8; NUM_LEDS],
     }
 
-    #[init(local = [flash: Option<Parts> = None])]
+    #[init(local = [flash: Option<Parts> = None,
+                    BB: BBBuffer<BUFF_SIZE> = BBBuffer::new()])]
     fn init(mut c: init::Context) -> (Shared, Local, init::Monotonics) {
         defmt::info!("Starting !!!");
 
@@ -296,7 +298,7 @@ mod app {
             c.device.USART2,
             (tx, rx),
             &mut afio.mapr,
-            Config::default().baudrate(19200.bps()),
+            Config::default().baudrate(38400.bps()),
             clocks,
         )
         .split();
@@ -319,10 +321,15 @@ mod app {
             NoMiso,
             gpiob.pb15.into_alternate_push_pull(&mut gpiob.crh),
         );
-        let spi = Spi::spi2(c.device.SPI2, pins, ws2812::MODE, 3800.khz(), clocks);
-        let leds = [RGB8::default(); NUM_LEDS];
+        let mode: Mode = Mode {
+            polarity: Polarity::IdleLow,
+            phase: Phase::CaptureOnFirstTransition,
+        };
+        let spi = Spi::spi2(c.device.SPI2, pins, mode, 3800.khz(), clocks);
+        let dma = c.device.DMA1.split();
+        let ws = spi.with_tx_dma(dma.5);
 
-        let mut ws = Ws2812::new(spi);
+        let leds = [RGB8::default(); NUM_LEDS];
 
         let mut dcb = c.core.DCB;
         let dwt = c.core.DWT;
@@ -330,7 +337,7 @@ mod app {
         let mono = DwtSystick::new(&mut dcb, dwt, systick, clocks.sysclk().0);
 
         let parser = Parser::new().sentence_filter(Sentence::RMC | Sentence::RMC);
-        let (prod, cons) = BB.try_split().unwrap();
+        let (prod, cons) = c.local.BB.try_split().unwrap();
 
         let mut eeprom = flash.eeprom(EEPROM_PARAMS);
         eeprom.init().unwrap();
@@ -386,8 +393,6 @@ mod app {
         enc_timer.listen(Event::Update);
 
         let wdg = IndependentWatchdog::new(c.device.IWDG);
-
-        leds_write(&mut ws, &leds);
         main_sm::spawn(MainEvent::Timeout).unwrap();
 
         (
@@ -404,7 +409,7 @@ mod app {
                 pps,
                 rx,
                 parser,
-                ws,
+                ws: Some(ws),
                 prod,
                 cons,
                 dst,
@@ -421,7 +426,7 @@ mod app {
         )
     }
 
-    #[task(binds = USART2, shared = [], local = [rx, prod], priority = 8)]
+    #[task(binds = USART2, shared = [], local = [rx, prod], priority = 16)]
     fn usart2(cx: usart2::Context) {
         let rx = cx.local.rx;
         let prod = cx.local.prod;
@@ -613,10 +618,6 @@ mod app {
         gps_locked.lock(|gps_locked| *gps_locked = false)
     }
 
-    fn leds_write(ws: &mut Leds, leds: &[RGB<u8>; NUM_LEDS]) {
-        ws.write(leds.iter().cloned()).unwrap();
-    }
-
     fn char_to_segs(c: char) -> u8 {
         match c {
             '0'..='9' => SYMBOL_TO_SEGS[(c as usize) - ('0' as usize)],
@@ -686,13 +687,52 @@ mod app {
         }
     }
 
+    fn leds_write_byte(data: &mut [u8], mut byte: u8) {
+        const PATTERNS: [u8; 4] = [0b1000_1000, 0b1000_1110, 0b11101000, 0b11101110];
+        for index in 0..4 {
+            let bits = (byte & 0b1100_0000) >> 6;
+            data[index] = PATTERNS[bits as usize];
+            byte <<= 2;
+        }
+    }
+
+    fn leds_write_bytes(data: &mut [u8; LEDS_BUF_SIZE], leds: &[RGB8; NUM_LEDS]) {
+        for (i, rgb) in leds.iter().enumerate() {
+            let j = 12 * i;
+            leds_write_byte(&mut data[j..j + 4], rgb.g);
+            leds_write_byte(&mut data[j + 4..j + 8], rgb.r);
+            leds_write_byte(&mut data[j + 8..j + 12], rgb.b);
+        }
+    }
+
+    fn leds_write(
+        data: &'static mut [u8; LEDS_BUF_SIZE],
+        leds: &[RGB8; NUM_LEDS],
+        xs: &mut Option<Xfer>,
+        ws: &mut Option<Leds>,
+    ) {
+        leds_write_bytes(data, leds);
+        if let Some(xfer) = xs.take() {
+            let (_, spi_dma) = xfer.wait();
+            *xs = Some(spi_dma.write(data));
+        } else {
+            if let Some(spi_dma) = ws.take() {
+                *xs = Some(spi_dma.write(data));
+            } else {
+                defmt::panic!();
+            }
+        }
+    }
+
     #[task(local = [ws, leds, is_trans: bool = false,
+                    xfer: Option<Xfer> = None,
                     prev_dg: [char; 6] = [' '; 6],
                     trans_state: [[LightTransition; NUM_SEGS]; 6] = [[LightTransition::Finished {state: false}; NUM_SEGS]; 6],
                     curr_color: RGB8 = RGB8::new(0, 0, 0),
                     handle: Option<light::SpawnHandle> = None],
-                        priority = 16, capacity = 3)]
+                        priority = 8, capacity = 3)]
     fn light(cx: light::Context, ev: LightEvent) {
+        static mut LEDS_BUF: [u8; LEDS_BUF_SIZE] = [0; LEDS_BUF_SIZE];
         let ws = cx.local.ws;
         let leds = cx.local.leds;
         let is_trans = cx.local.is_trans;
@@ -752,7 +792,9 @@ mod app {
                 } else {
                     leds_draw_colon(leds, 1, 0, RGB8::default());
                 }
-                leds_write(ws, leds);
+                unsafe {
+                    leds_write(&mut LEDS_BUF, leds, cx.local.xfer, ws);
+                }
             }
             LightEvent::TIMEOUT => {
                 defmt::assert!(*is_trans);
@@ -766,7 +808,9 @@ mod app {
                     let segs: [u8; NUM_SEGS] = d.map(transition_to_brightness);
                     leds_draw_digit(leds, x, segs, *curr_color);
                 }
-                leds_write(ws, leds);
+                unsafe {
+                    leds_write(&mut LEDS_BUF, leds, cx.local.xfer, ws);
+                }
 
                 if !(*trans_state).iter().all(|x| {
                     x.iter()
@@ -1475,6 +1519,7 @@ mod app {
         let alarm_time = cx.local.alarm_time;
         let datetime = cx.local.dt;
         let color = cx.local.color;
+        (*color).hue += 1;
 
         match state {
             MainState::NoSync { s } => match ev {

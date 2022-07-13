@@ -28,7 +28,6 @@ profont = "0.5.0"
 ssd1306 = "0.7"
 
 smart-leds = "0.3.0"
-ws2812-spi = { git = "https://github.com/smart-leds-rs/ws2812-spi-rs.git", branch = "master" }
 eeprom = { version = "0.2.0" , features = ["stm32f103"] }
 rotary-encoder-hal = "0.5.0"
 
