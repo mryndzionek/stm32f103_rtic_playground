@@ -384,6 +384,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "infrared"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d5b42e241fbd6670b93694013ced5c0e89fb1d2190cef4fc481d2bb5b491453"
+dependencies = [
+ "embedded-hal",
+ "fugit",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -729,6 +739,7 @@ dependencies = [
  "embedded-graphics",
  "embedded-hal",
  "heapless",
+ "infrared",
  "nb 1.0.0",
  "nmea0183",
  "oorandom",

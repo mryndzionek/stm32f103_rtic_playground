@@ -9,10 +9,12 @@ mod app {
     use core::fmt::{Debug, Write};
     use core::iter::Peekable;
     use core::slice::Iter;
-    use defmt::{write, Format, Formatter};
+    use defmt::{write, Debug2Format, Format, Formatter};
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
     use eeprom::{EEPROMExt, Params, EEPROM};
     use heapless::{String, Vec};
+    use infrared::protocol::Nec;
+    use infrared::Receiver;
     use nmea0183::{
         coords::{Hemisphere, Latitude, Longitude},
         ParseResult, Parser, Sentence,
@@ -25,9 +27,9 @@ mod app {
     };
     use stm32f103_rtic_playground as _;
     use stm32f1xx_hal::gpio::{
-        gpioa::PA1,
+        gpioa::{PA1, PA4},
         gpioc::PC13,
-        Alternate, Edge, ExtiPin, Input, Output, PullDown, PushPull,
+        Alternate, Edge, ExtiPin, Floating, Input, Output, PullDown, PushPull,
     };
     use stm32f1xx_hal::watchdog::IndependentWatchdog;
     use stm32f1xx_hal::{
@@ -101,6 +103,9 @@ mod app {
     const FREQ: u32 = 72_000_000;
     #[monotonic(binds = SysTick, default = true)]
     type MyMono = DwtSystick<FREQ>;
+
+    type IrPin = PA4<Input<Floating>>;
+    pub type IrReceiver = Receiver<Nec, IrPin, dwt_systick_monotonic::fugit::Instant<u32, 1, FREQ>>;
 
     const SEG_LEN: usize = (5 * 4) + 5 + 3;
     const COLON_LEN: usize = 4;
@@ -250,6 +255,7 @@ mod app {
         alarm_enabled: bool,
         alarm_time: Time,
         leds: [RGB8; NUM_LEDS],
+        receiver: IrReceiver,
     }
 
     #[init(local = [flash: Option<Parts> = None,
@@ -303,11 +309,6 @@ mod app {
         pps.make_interrupt_source(&mut afio);
         pps.enable_interrupt(&mut c.device.EXTI);
         pps.trigger_on_edge(&mut c.device.EXTI, Edge::Rising);
-
-        let mut btn = gpioa.pa4.into_pull_up_input(&mut gpioa.crl);
-        btn.make_interrupt_source(&mut afio);
-        btn.enable_interrupt(&mut c.device.EXTI);
-        btn.trigger_on_edge(&mut c.device.EXTI, Edge::Falling);
 
         let mut gpiob = c.device.GPIOB.split();
         let pins = (
@@ -379,6 +380,13 @@ mod app {
         );
         buzz_pwm.set_duty(Channel::C1, 2 * (buzz_pwm.get_max_duty() / 100));
 
+        let mut pin = gpioa.pa4.into_floating_input(&mut gpioa.crl);
+        pin.make_interrupt_source(&mut afio);
+        pin.trigger_on_edge(&c.device.EXTI, Edge::RisingFalling);
+        pin.enable_interrupt(&c.device.EXTI);
+
+        let receiver = Receiver::with_fugit(pin);
+
         let wdg = IndependentWatchdog::new(c.device.IWDG);
         main_sm::spawn(MainEvent::Timeout).unwrap();
 
@@ -404,6 +412,7 @@ mod app {
                 alarm_enabled,
                 alarm_time,
                 leds,
+                receiver,
             },
             init::Monotonics(mono),
         )
@@ -1308,6 +1317,18 @@ mod app {
         ShortPressWait,
     }
 
+    #[task(binds = EXTI4, shared = [],
+        local = [receiver], priority = 2)]
+    fn ir_isr(cx: ir_isr::Context) {
+        let receiver = cx.local.receiver;
+        let now = monotonics::now();
+
+        if let Ok(Some(cmd)) = receiver.event_instant(now) {
+            defmt::info!("Cmd: {:?}", Debug2Format(&cmd));
+        }
+
+        receiver.pin_mut().clear_interrupt_pending_bit();
+    }
     pub enum MainState {
         NoSync {
             s: bool,

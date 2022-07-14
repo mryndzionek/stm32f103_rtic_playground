@@ -27,6 +27,8 @@ embedded-graphics = "0.7"
 profont = "0.5.0"
 ssd1306 = "0.7"
 
+infrared = "0.14"
+
 smart-leds = "0.3.0"
 eeprom = { version = "0.2.0" , features = ["stm32f103"] }
 
