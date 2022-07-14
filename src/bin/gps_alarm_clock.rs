@@ -18,7 +18,6 @@ mod app {
         ParseResult, Parser, Sentence,
     };
     use oorandom::Rand32;
-    use rotary_encoder_hal::{Direction as EncDir, Rotary};
     use rtic::Monotonic;
     use smart_leds::{
         hsv::{hsv2rgb, Hsv},
@@ -26,21 +25,20 @@ mod app {
     };
     use stm32f103_rtic_playground as _;
     use stm32f1xx_hal::gpio::{
-        gpioa::{PA1, PA4},
-        gpiob::{PB0, PB1},
+        gpioa::PA1,
         gpioc::PC13,
-        Alternate, Edge, ExtiPin, Input, Output, PullDown, PullUp, PushPull,
+        Alternate, Edge, ExtiPin, Input, Output, PullDown, PushPull,
     };
     use stm32f1xx_hal::watchdog::IndependentWatchdog;
     use stm32f1xx_hal::{
         dma::{Transfer, TxDma},
         flash::{FlashSize, Parts, SectorSize},
-        pac::{EXTI, TIM2, TIM3},
+        pac::TIM3,
         prelude::*,
         pwm::{Channel, Pwm, C1},
         serial::{Config, Rx2, Serial},
         spi::{Mode, NoMiso, NoSck, Phase, Polarity, Spi, Spi2NoRemap},
-        timer::{CountDownTimer, Event, Tim3NoRemap, Timer},
+        timer::{Tim3NoRemap, Timer},
     };
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
@@ -218,8 +216,6 @@ mod app {
         gps_locked: bool,
         pps_timeout: Option<pps_timeout::SpawnHandle>,
         eeprom: EEPROM<&'static mut stm32f1xx_hal::flash::Parts>,
-        btn_pin: PA4<Input<PullUp>>,
-        exti: EXTI,
     }
 
     type Leds = TxDma<
@@ -250,8 +246,6 @@ mod app {
         dst: Duration,
         buzz_pwm: Pwm<TIM3, Tim3NoRemap, C1, stm32f1xx_hal::gpio::gpioa::PA6<Alternate<PushPull>>>,
         wdg: IndependentWatchdog,
-        enc_timer: CountDownTimer<TIM2>,
-        encoder: Rotary<PB0<Input<PullUp>>, PB1<Input<PullUp>>>,
         rng: Rand32,
         alarm_enabled: bool,
         alarm_time: Time,
@@ -385,13 +379,6 @@ mod app {
         );
         buzz_pwm.set_duty(Channel::C1, 2 * (buzz_pwm.get_max_duty() / 100));
 
-        let enc_a = gpiob.pb0.into_pull_up_input(&mut gpiob.crl);
-        let enc_b = gpiob.pb1.into_pull_up_input(&mut gpiob.crl);
-        let encoder = Rotary::new(enc_a, enc_b);
-
-        let mut enc_timer = Timer::tim2(c.device.TIM2, &clocks).start_count_down(1000.hz());
-        enc_timer.listen(Event::Update);
-
         let wdg = IndependentWatchdog::new(c.device.IWDG);
         main_sm::spawn(MainEvent::Timeout).unwrap();
 
@@ -401,8 +388,6 @@ mod app {
                 gps_locked: false,
                 pps_timeout: None,
                 eeprom,
-                btn_pin: btn,
-                exti: c.device.EXTI,
             },
             Local {
                 led,
@@ -415,8 +400,6 @@ mod app {
                 dst,
                 buzz_pwm,
                 wdg,
-                enc_timer,
-                encoder,
                 rng: Rand32::new(666),
                 alarm_enabled,
                 alarm_time,
@@ -1325,83 +1308,6 @@ mod app {
         ShortPressWait,
     }
 
-    #[task(binds = EXTI4, shared = [btn_pin, exti],
-        local = [], priority = 2)]
-    fn button_isr(cx: button_isr::Context) {
-        let btn = cx.shared.btn_pin;
-        let exti = cx.shared.exti;
-
-        (btn, exti).lock(|btn, exti| {
-            btn.disable_interrupt(exti);
-            btn.clear_interrupt_pending_bit();
-            btn_debouncer::spawn_after(20.millis()).unwrap();
-        });
-    }
-
-    #[task(local = [is_pressed: bool = false],
-        shared = [btn_pin, exti],
-        priority = 2)]
-    fn btn_debouncer(cx: btn_debouncer::Context) {
-        let btn = cx.shared.btn_pin;
-        let exti = cx.shared.exti;
-        let is_pressed = cx.local.is_pressed;
-
-        (btn, exti).lock(|btn, exti| {
-            if *is_pressed {
-                if btn.is_high() {
-                    btn.trigger_on_edge(exti, Edge::Falling);
-                    *is_pressed = false;
-                    btn_detector::spawn(ButtonEvent::Depressed).unwrap();
-                }
-            } else {
-                if btn.is_low() {
-                    btn.trigger_on_edge(exti, Edge::Rising);
-                    *is_pressed = true;
-                    btn_detector::spawn(ButtonEvent::Pressed).unwrap();
-                }
-            }
-            btn.enable_interrupt(exti);
-        });
-    }
-
-    #[task(local = [state: ButtonState = ButtonState::Idle,
-                    handle: Option<btn_detector::SpawnHandle> = None],
-        capacity = 2,
-        priority = 2)]
-    fn btn_detector(cx: btn_detector::Context, ev: ButtonEvent) {
-        let state = cx.local.state;
-        let handle = cx.local.handle;
-
-        match state {
-            ButtonState::Idle => match ev {
-                ButtonEvent::Pressed => {
-                    *handle = btn_detector::spawn_after(750.millis(), ButtonEvent::Timeout).ok();
-                    *state = ButtonState::ShortPressWait;
-                }
-                ButtonEvent::Depressed => {}
-                _ => defmt::panic!(),
-            },
-            ButtonState::ShortPressWait => match ev {
-                ButtonEvent::Depressed => {
-                    // we have a short press
-                    if let Some(handle) = handle.take() {
-                        handle.cancel().ok();
-                    }
-                    main_sm::spawn(MainEvent::ShortButtonPress).unwrap();
-                    *state = ButtonState::Idle;
-                }
-                ButtonEvent::Timeout => {
-                    // we have a long press
-                    main_sm::spawn(MainEvent::LongButtonPress).unwrap();
-                    *state = ButtonState::Idle;
-                }
-                _ => {
-                    defmt::panic!();
-                }
-            },
-        }
-    }
-
     pub enum MainState {
         NoSync {
             s: bool,
@@ -1425,9 +1331,6 @@ mod app {
         },
         ShortButtonPress,
         LongButtonPress,
-        Encoder {
-            dir: EncDir,
-        },
     }
 
     fn pps_tick_handler(dt: Option<PrimitiveDateTime>, mode: &mut LightTickMode) {
@@ -1483,7 +1386,7 @@ mod app {
         if mode == LightTickMode::NIGHT {
             color = color
                 .iter()
-                .map(|v| ((v as usize) * (GAMMA8[100] as usize) / 255) as u8)
+                .map(|v| ((v as usize) * (GAMMA8[60] as usize) / 255) as u8)
                 .collect();
         }
         light::spawn(LightEvent::DIGITS {
@@ -1519,7 +1422,11 @@ mod app {
         let alarm_time = cx.local.alarm_time;
         let datetime = cx.local.dt;
         let color = cx.local.color;
-        (*color).hue += 1;
+        if *curr_mode == LightTickMode::NIGHT {
+            *color = LED_COLOR_DAY;
+        } else {
+            (*color).hue = color.hue.wrapping_add(1);
+        }
 
         match state {
             MainState::NoSync { s } => match ev {
@@ -1619,7 +1526,6 @@ mod app {
                         eeprom.write(1, *cx.local.alarm_enabled as u16).unwrap();
                     });
                 }
-                _ => (),
             },
             MainState::Sunrise { ramp, prev_val } => match ev {
                 MainEvent::PPSTick { dt, gps_lock: _ } => {
@@ -1724,17 +1630,6 @@ mod app {
                     })
                     .unwrap();
                 }
-                MainEvent::Encoder { dir } => match dir {
-                    EncDir::Clockwise => {
-                        *alarm_time += Duration::minutes(5);
-                        disp_time(*alarm_time, *color, curr_mode.clone());
-                    }
-                    EncDir::CounterClockwise => {
-                        *alarm_time -= Duration::minutes(5);
-                        disp_time(*alarm_time, *color, curr_mode.clone());
-                    }
-                    _ => (),
-                },
                 _ => (),
             },
             MainState::ColorSetting => {
@@ -1763,53 +1658,12 @@ mod app {
                         }
                         *state = MainState::TimeDisplay;
                     }
-                    MainEvent::Encoder { dir } => match dir {
-                        EncDir::Clockwise => {
-                            (*color).hue += 1;
-                        }
-                        EncDir::CounterClockwise => {
-                            (*color).hue -= 1;
-                        }
-                        _ => (),
-                    },
                 }
                 if let Some(dt) = *datetime {
                     disp_time(dt.time(), *color, curr_mode.clone());
                 }
             }
         }
-    }
-
-    #[task(binds = TIM2, local = [enc_timer, encoder, pos: isize = 0],
-           priority = 2)]
-    fn enc_timer(cx: enc_timer::Context) {
-        let timer = cx.local.enc_timer;
-        let encoder = cx.local.encoder;
-        let pos = cx.local.pos;
-
-        match encoder.update().unwrap() {
-            EncDir::Clockwise => {
-                *pos += 1;
-                if *pos % 2 == 0 {
-                    main_sm::spawn(MainEvent::Encoder {
-                        dir: EncDir::Clockwise,
-                    })
-                    .unwrap();
-                }
-            }
-            EncDir::CounterClockwise => {
-                *pos -= 1;
-                if *pos % 2 == 0 {
-                    main_sm::spawn(MainEvent::Encoder {
-                        dir: EncDir::CounterClockwise,
-                    })
-                    .unwrap();
-                }
-            }
-            EncDir::None => {}
-        }
-
-        timer.clear_update_interrupt_flag();
     }
 
     #[idle(local = [led, wdg])]
