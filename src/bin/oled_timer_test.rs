@@ -109,7 +109,7 @@ mod app {
             .into_buffered_graphics_mode();
         display.init().unwrap();
         display.set_brightness(Brightness::BRIGHTEST).unwrap();
-        let _ = display.clear();
+        display.clear();
 
         let mut gpioc = c.device.GPIOC.split();
         let mut led = gpioc.pc13.into_push_pull_output(&mut gpioc.crh);
@@ -147,7 +147,7 @@ mod app {
             } else {
                 *up = true;
             }
-            *c = *c + 1;
+            *c += 1;
             if *c == 1000000 {
                 *c = 0;
             }

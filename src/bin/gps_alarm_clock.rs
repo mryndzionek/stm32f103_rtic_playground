@@ -260,7 +260,7 @@ mod app {
 
     #[init(local = [flash: Option<Parts> = None,
                     BB: BBBuffer<BUFF_SIZE> = BBBuffer::new()])]
-    fn init(mut c: init::Context) -> (Shared, Local, init::Monotonics) {
+    fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
         defmt::info!("Starting !!!");
 
         // workaround, see: https://github.com/knurling-rs/defmt/issues/322
@@ -307,8 +307,8 @@ mod app {
 
         let mut pps = gpioa.pa1.into_pull_down_input(&mut gpioa.crl);
         pps.make_interrupt_source(&mut afio);
-        pps.enable_interrupt(&mut c.device.EXTI);
-        pps.trigger_on_edge(&mut c.device.EXTI, Edge::Rising);
+        pps.enable_interrupt(&c.device.EXTI);
+        pps.trigger_on_edge(&c.device.EXTI, Edge::Rising);
 
         let mut gpiob = c.device.GPIOB.split();
         let pins = (
@@ -331,7 +331,7 @@ mod app {
         let systick = c.core.SYST;
         let mono = DwtSystick::new(&mut dcb, dwt, systick, clocks.sysclk().0);
 
-        let parser = Parser::new().sentence_filter(Sentence::RMC | Sentence::RMC);
+        let parser = Parser::new().sentence_only(Sentence::RMC);
         let (prod, cons) = c.local.BB.try_split().unwrap();
 
         let mut eeprom = flash.eeprom(EEPROM_PARAMS);
@@ -378,7 +378,7 @@ mod app {
             &mut afio.mapr,
             BUZZER_BASE_FREQ_HZ.hz(),
         );
-        buzz_pwm.set_duty(Channel::C1, 2 * (buzz_pwm.get_max_duty() / 100));
+        buzz_pwm.set_duty(Channel::C1, 10 * (buzz_pwm.get_max_duty() / 100));
 
         let mut pin = gpioa.pa4.into_floating_input(&mut gpioa.crl);
         pin.make_interrupt_source(&mut afio);
@@ -389,6 +389,7 @@ mod app {
 
         let wdg = IndependentWatchdog::new(c.device.IWDG);
         main_sm::spawn(MainEvent::Timeout).unwrap();
+        buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
 
         (
             Shared {
@@ -428,7 +429,7 @@ mod app {
                     let mut wgr = prod.grant_exact(1).unwrap();
                     wgr[0] = b;
                     wgr.commit(1);
-                    if b == '\n' as u8 {
+                    if b == b'\n' {
                         parse::spawn().ok();
                     }
                 }
@@ -455,10 +456,10 @@ mod app {
             unsafe {
                 if !SM {
                     SM = true;
-                    return -Duration::HOUR;
+                    -Duration::HOUR
                 } else {
                     SM = false;
-                    return Duration::ZERO;
+                    Duration::ZERO
                 }
             }
         } else if (dt.month() == Month::March)
@@ -466,9 +467,9 @@ mod app {
             && (dt.weekday() == Weekday::Sunday)
             && (tm == time!(2:00:00))
         {
-            return Duration::HOUR;
+            Duration::HOUR
         } else {
-            return Duration::ZERO;
+            Duration::ZERO
         }
     }
 
@@ -485,7 +486,7 @@ mod app {
 
         let mut res1 = (gps_locked, pps_timeout);
 
-        if let Some(rgr) = cons.read().ok() {
+        if let Ok(rgr) = cons.read() {
             defmt::trace!("{}", &rgr.buf());
 
             for result in parser.parse_from_bytes(&rgr) {
@@ -520,14 +521,14 @@ mod app {
                         let date = Date::from_calendar_date(
                             year.try_into().unwrap(),
                             month.try_into().unwrap(),
-                            day.try_into().unwrap(),
+                            day,
                         )
                         .unwrap();
                         let time = Time::from_hms(hours, minutes, seconds as u8).unwrap();
                         let date_time = PrimitiveDateTime::new(date, time);
                         datetime.lock(|dt| match *dt {
                             Some(dt) => {
-                                defmt::assert!(dt == date_time);
+                                defmt::warn!("Unexpected date_time: {} != {}", date_time, dt);
                             }
                             None => {
                                 *dt = Some(date_time);
@@ -655,7 +656,7 @@ mod app {
                 } else {
                     LightTransition::InProgress {
                         brightness: nv.try_into().unwrap(),
-                        slope: slope,
+                        slope,
                     }
                 }
             }
@@ -681,9 +682,9 @@ mod app {
 
     fn leds_write_byte(data: &mut [u8], mut byte: u8) {
         const PATTERNS: [u8; 4] = [0b1000_1000, 0b1000_1110, 0b11101000, 0b11101110];
-        for index in 0..4 {
+        for d in data.iter_mut().take(4) {
             let bits = (byte & 0b1100_0000) >> 6;
-            data[index] = PATTERNS[bits as usize];
+            *d = PATTERNS[bits as usize];
             byte <<= 2;
         }
     }
@@ -707,12 +708,10 @@ mod app {
         if let Some(xfer) = xs.take() {
             let (_, spi_dma) = xfer.wait();
             *xs = Some(spi_dma.write(data));
+        } else if let Some(spi_dma) = ws.take() {
+            *xs = Some(spi_dma.write(data));
         } else {
-            if let Some(spi_dma) = ws.take() {
-                *xs = Some(spi_dma.write(data));
-            } else {
-                defmt::panic!();
-            }
+            defmt::panic!();
         }
     }
 
@@ -846,7 +845,7 @@ mod app {
         Alarm { i: Option<usize> },
     }
 
-    const ALARMS: &'static [&'static [(u16, u16)]] = &[
+    const ALARMS: &[&[(u16, u16)]] = &[
         &[
             (0, 42),
             (1175, 167),
@@ -1292,16 +1291,16 @@ mod app {
         let dx = x * SEG_LEN + (COLON_LEN * (x / 2));
         for (i, s) in segs.iter().enumerate() {
             let (o, l) = SEG_TO_OFFSET[i];
-            for i in dx + o..dx + o + l {
-                leds[i] = dim_color(color, *s);
+            for l in leds.iter_mut().skip(dx + o).take(l) {
+                *l = dim_color(color, *s);
             }
         }
     }
 
     fn leds_draw_colon(leds: &mut [RGB8; NUM_LEDS], x: usize, b: u8, color: RGB8) {
         let offset = 2 * SEG_LEN + ((2 * SEG_LEN) + COLON_LEN) * x;
-        for i in offset..offset + COLON_LEN {
-            leds[i] = dim_color(color, b);
+        for l in leds.iter_mut().skip(offset).take(COLON_LEN) {
+            *l = dim_color(color, b);
         }
     }
 
@@ -1323,8 +1322,9 @@ mod app {
         let receiver = cx.local.receiver;
         let now = monotonics::now();
 
+        //defmt::error!("xxx {}", now.ticks());
         if let Ok(Some(cmd)) = receiver.event_instant(now) {
-            defmt::info!("Cmd: {:?}", Debug2Format(&cmd));
+            defmt::error!("Cmd: {:?}", Debug2Format(&cmd));
         }
 
         receiver.pin_mut().clear_interrupt_pending_bit();
@@ -1381,12 +1381,12 @@ mod app {
             let h = dt.time().hour();
             match *mode {
                 LightTickMode::DAY => {
-                    if h > 21 || h < 7 {
+                    if !(7..=21).contains(&h) {
                         *mode = LightTickMode::NIGHT;
                     }
                 }
                 LightTickMode::NIGHT => {
-                    if h <= 21 && h >= 7 {
+                    if (7..=21).contains(&h) {
                         *mode = LightTickMode::DAY;
                     }
                 }
@@ -1414,7 +1414,7 @@ mod app {
             dg: Some(dg),
             col1: true,
             col2: true,
-            color: color,
+            color,
         })
         .unwrap();
     }
@@ -1489,27 +1489,25 @@ mod app {
                     pps_tick_handler(dt, curr_mode);
                     *datetime = dt;
                     if let Some(dt) = *datetime {
-                        if *cx.local.alarm_enabled {
-                            if ![Weekday::Saturday, Weekday::Sunday].contains(&dt.date().weekday())
-                            {
-                                if dt.time() == (*alarm_time - SUNRISE_LEN) {
-                                    defmt::info!("Starting sunrise");
+                        if *cx.local.alarm_enabled
+                            && ![Weekday::Saturday, Weekday::Sunday].contains(&dt.date().weekday())
+                            && dt.time() == (*alarm_time - SUNRISE_LEN)
+                        {
+                            defmt::info!("Starting sunrise");
 
-                                    *state = MainState::Sunrise {
-                                        ramp: Bresenham::new(
-                                            (0, 0),
-                                            (
-                                                SUNRISE_LEN.whole_seconds().try_into().unwrap(),
-                                                SUNRISE_CMAP.len().try_into().unwrap(),
-                                            ),
-                                        )
-                                        .peekable(),
-                                        prev_val: None,
-                                    };
+                            *state = MainState::Sunrise {
+                                ramp: Bresenham::new(
+                                    (0, 0),
+                                    (
+                                        SUNRISE_LEN.whole_seconds().try_into().unwrap(),
+                                        SUNRISE_CMAP.len().try_into().unwrap(),
+                                    ),
+                                )
+                                .peekable(),
+                                prev_val: None,
+                            };
 
-                                    main_sm::spawn(ev).unwrap();
-                                }
-                            }
+                            main_sm::spawn(ev).unwrap();
                         }
 
                         disp_time(dt.time(), *color, curr_mode.clone());
