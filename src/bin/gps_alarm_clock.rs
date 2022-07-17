@@ -97,6 +97,62 @@ mod app {
         }
     }
 
+    pub struct LinearRamp {
+        start: usize,
+        end: usize,
+        b: Peekable<Bresenham>,
+    }
+
+    impl LinearRamp {
+        #[inline]
+        pub fn new(start: usize, end: usize) -> LinearRamp {
+            LinearRamp {
+                start,
+                end,
+                b: Bresenham::new((0, 0), (start.try_into().unwrap(), end.try_into().unwrap()))
+                    .peekable(),
+            }
+        }
+    }
+
+    impl PartialEq for LinearRamp {
+        fn eq(&self, other: &Self) -> bool {
+            (self.start == other.start) && (self.end == other.end)
+        }
+    }
+
+    impl Iterator for LinearRamp {
+        type Item = isize;
+
+        #[inline]
+        fn next(&mut self) -> Option<Self::Item> {
+            let v;
+            loop {
+                match self.b.next() {
+                    Some((cx, cy)) => match self.b.peek() {
+                        Some((nx, _)) => {
+                            if cx != *nx {
+                                v = Some(cy);
+                                break;
+                            } else {
+                                continue;
+                            }
+                        }
+                        None => {
+                            v = Some(cy);
+                            break;
+                        }
+                    },
+                    None => {
+                        v = None;
+                        break;
+                    }
+                }
+            }
+            v
+        }
+    }
+
     const FREQ: u32 = 72_000_000;
     #[monotonic(binds = SysTick, default = true)]
     type MyMono = DwtSystick<FREQ>;
@@ -233,16 +289,18 @@ mod app {
             dg: Option<[char; 6]>,
             col1: bool,
             col2: bool,
-            mode: LightTickMode,
+            color: Option<RGB8>,
         },
         TIMEOUT,
     }
 
-    #[derive(Debug, PartialEq, Clone, Copy)]
+    #[derive(PartialEq)]
     #[allow(non_camel_case_types)]
     pub enum LightTickMode {
         DAY,
         NIGHT,
+        SUNRISE { ramp: LinearRamp },
+        ALARM,
     }
 
     #[derive(Debug, PartialEq, Clone, Copy)]
@@ -760,7 +818,7 @@ mod app {
     #[task(local = [ws, leds, is_trans: bool = false,
                     xfer: Option<Xfer> = None,
                     prev_dg: [char; 6] = [' '; 6],
-                    color: Option<RGB8> = None,
+                    curr_color: Option<RGB8> = None,
                     trans_state: [[LightTransition; NUM_SEGS]; 6] = [[LightTransition::Finished {state: false}; NUM_SEGS]; 6],
                     handle: Option<light::SpawnHandle> = None],
                         priority = 8, capacity = 3)]
@@ -772,14 +830,14 @@ mod app {
         let prev_dg = cx.local.prev_dg;
         let trans_state = cx.local.trans_state;
         let handle = cx.local.handle;
-        let color = cx.local.color;
+        let curr_color = cx.local.curr_color;
 
         match ev {
             LightEvent::DIGITS {
                 dg,
                 col1,
                 col2,
-                mode,
+                color,
             } => {
                 if *is_trans {
                     if let Some(handle) = handle.take() {
@@ -811,28 +869,18 @@ mod app {
                     }
                     *is_trans = true;
                     *prev_dg = dg;
+                    *curr_color = color;
                     defmt::info!("Transition started");
                     *handle = light::spawn_after(LED_FADE_SPEED.millis(), LightEvent::TIMEOUT).ok();
                 }
 
-                if mode == LightTickMode::NIGHT {
-                    *color = Some(
-                        DEFAULT_LED_COLOR
-                            .iter()
-                            .map(|v| ((v as usize) * (GAMMA8[60] as usize) / 255) as u8)
-                            .collect(),
-                    );
-                } else {
-                    *color = None;
-                }
-
                 if col1 {
-                    leds_draw_colon(leds, 0, LED_FADE_MAX, (*color).unwrap_or(DEFAULT_LED_COLOR));
+                    leds_draw_colon(leds, 0, LED_FADE_MAX, color.unwrap_or(DEFAULT_LED_COLOR));
                 } else {
                     leds_draw_colon(leds, 0, 0, RGB8::default());
                 }
                 if col2 {
-                    leds_draw_colon(leds, 1, LED_FADE_MAX, (*color).unwrap_or(DEFAULT_LED_COLOR));
+                    leds_draw_colon(leds, 1, LED_FADE_MAX, color.unwrap_or(DEFAULT_LED_COLOR));
                 } else {
                     leds_draw_colon(leds, 1, 0, RGB8::default());
                 }
@@ -850,7 +898,7 @@ mod app {
 
                 for (x, d) in (*trans_state).iter().rev().enumerate() {
                     let segs: [u8; NUM_SEGS] = d.map(transition_to_brightness);
-                    leds_draw_digit(leds, x, segs, *color);
+                    leds_draw_digit(leds, x, segs, *curr_color);
                 }
                 unsafe {
                     leds_write(&mut LEDS_BUF, leds, cx.local.xfer, ws);
@@ -1394,17 +1442,9 @@ mod app {
         receiver.pin_mut().clear_interrupt_pending_bit();
     }
     pub enum MainState {
-        NoSync {
-            s: bool,
-        },
+        NoSync { s: bool },
         TimeDisplay,
-        Sunrise {
-            ramp: Peekable<Bresenham>,
-            prev_val: Option<isize>,
-        },
-        Alarm,
         AlarmSetting,
-        ColorSetting,
     }
 
     #[derive(Debug)]
@@ -1418,7 +1458,11 @@ mod app {
         LongButtonPress,
     }
 
-    fn pps_tick_handler(dt: Option<PrimitiveDateTime>, mode: &mut LightTickMode) {
+    fn pps_tick_handler(
+        dt: Option<PrimitiveDateTime>,
+        mode: &mut LightTickMode,
+        alarm_dur: &mut Duration,
+    ) {
         if let Some(dt) = dt {
             let s = dt.time().second();
             if *mode == LightTickMode::DAY {
@@ -1454,11 +1498,18 @@ mod app {
                         *mode = LightTickMode::DAY;
                     }
                 }
+                LightTickMode::ALARM => {
+                    *alarm_dur += Duration::SECOND;
+                    if *alarm_dur == ALARM_LEN {
+                        buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    fn disp_time(time: Time, mode: LightTickMode) {
+    fn disp_time(time: Time, mode: &mut LightTickMode, alarm_dur: &mut Duration) {
         let (h, m, s) = time.as_hms();
         let mut buf: String<6> = String::new();
         buf.write_fmt(format_args!("{:02}{:02}{:02}", h, m, s))
@@ -1467,11 +1518,38 @@ mod app {
         if dg[0] == '0' {
             dg[0] = ' ';
         }
+
+        let color = match mode {
+            LightTickMode::DAY => None,
+            LightTickMode::NIGHT => Some(
+                DEFAULT_LED_COLOR
+                    .iter()
+                    .map(|v| ((v as usize) * (GAMMA8[60] as usize) / 255) as u8)
+                    .collect(),
+            ),
+            LightTickMode::SUNRISE { ramp } => {
+                if let Some(y) = ramp.next() {
+                    let rgb = SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()].to_be_bytes()
+                        [1..4]
+                        .iter()
+                        .map(|v| GAMMA8[*v as usize])
+                        .collect::<Vec<_, 3>>();
+                    Some(RGB8::new(rgb[0], rgb[1], rgb[2]) / 4)
+                } else {
+                    buzzer::spawn(BuzzerEvent::Alarm { i: Some(0) }).unwrap();
+                    *mode = LightTickMode::ALARM;
+                    *alarm_dur = Duration::ZERO;
+                    None
+                }
+            }
+            _ => None,
+        };
+
         light::spawn(LightEvent::DIGITS {
             dg: Some(dg),
             col1: true,
             col2: true,
-            mode,
+            color,
         })
         .unwrap();
     }
@@ -1507,7 +1585,7 @@ mod app {
                             dg: Some(str_to_array("noSync")),
                             col1: false,
                             col2: false,
-                            mode: LightTickMode::DAY,
+                            color: None,
                         })
                         .unwrap();
                         *state = MainState::NoSync { s: false };
@@ -1516,7 +1594,7 @@ mod app {
                             dg: Some([' '; 6]),
                             col1: false,
                             col2: false,
-                            mode: LightTickMode::DAY,
+                            color: None,
                         })
                         .unwrap();
                         *state = MainState::NoSync { s: true };
@@ -1536,7 +1614,7 @@ mod app {
             },
             MainState::TimeDisplay => match ev {
                 MainEvent::PPSTick { dt, gps_lock: _ } => {
-                    pps_tick_handler(dt, curr_mode);
+                    pps_tick_handler(dt, curr_mode, cx.local.alarm_dur);
                     *datetime = dt;
                     if let Some(dt) = *datetime {
                         if *cx.local.alarm_enabled
@@ -1544,23 +1622,15 @@ mod app {
                             && dt.time() == (*alarm_time - SUNRISE_LEN)
                         {
                             defmt::info!("Starting sunrise");
-
-                            *state = MainState::Sunrise {
-                                ramp: Bresenham::new(
-                                    (0, 0),
-                                    (
-                                        SUNRISE_LEN.whole_seconds().try_into().unwrap(),
-                                        SUNRISE_CMAP.len().try_into().unwrap(),
-                                    ),
-                                )
-                                .peekable(),
-                                prev_val: None,
+                            *curr_mode = LightTickMode::SUNRISE {
+                                ramp: LinearRamp::new(
+                                    SUNRISE_LEN.whole_seconds().try_into().unwrap(),
+                                    SUNRISE_CMAP.len(),
+                                ),
                             };
-
-                            main_sm::spawn(ev).unwrap();
                         }
 
-                        disp_time(dt.time(), *curr_mode);
+                        disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
                         *cx.local.handle =
                             main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
                     }
@@ -1570,7 +1640,7 @@ mod app {
                         dg: None,
                         col1: false,
                         col2: false,
-                        mode: *curr_mode,
+                        color: None,
                     })
                     .unwrap();
                 }
@@ -1578,7 +1648,7 @@ mod app {
                     if let Some(handle) = cx.local.handle.take() {
                         handle.cancel().ok();
                     }
-                    disp_time(*alarm_time, *curr_mode);
+                    disp_time(*alarm_time, curr_mode, cx.local.alarm_dur);
                     buzzer::spawn(BuzzerEvent::Alarm {
                         i: Some(*cx.local.curr_al),
                     })
@@ -1596,86 +1666,6 @@ mod app {
                     });
                 }
             },
-            MainState::Sunrise { ramp, prev_val } => match ev {
-                MainEvent::PPSTick { dt, gps_lock: _ } => {
-                    pps_tick_handler(dt, curr_mode);
-                    *datetime = dt;
-                    let v;
-                    loop {
-                        match ramp.next() {
-                            Some((cx, cy)) => match ramp.peek() {
-                                Some((nx, _)) => {
-                                    if cx != *nx {
-                                        v = Some(cy);
-                                        break;
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                                None => {
-                                    v = Some(cy);
-                                    break;
-                                }
-                            },
-                            None => {
-                                v = None;
-                                break;
-                            }
-                        }
-                    }
-
-                    match v {
-                        Some(y) => {
-                            if let Some(y) = match prev_val {
-                                None => Some(y),
-                                Some(v) => {
-                                    if *v == y {
-                                        None
-                                    } else {
-                                        Some(y)
-                                    }
-                                }
-                            } {
-                                let rgb = SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()]
-                                    .to_be_bytes()[1..4]
-                                    .iter()
-                                    .map(|v| GAMMA8[*v as usize])
-                                    .collect::<Vec<_, 3>>();
-                                let _c = RGB8::new(rgb[0], rgb[1], rgb[2]) / 4;
-                                //light::spawn(LightEvent::SOLID_COLOR { color: c }).unwrap();
-                                *prev_val = Some(y);
-                            }
-                        }
-                        None => {
-                            buzzer::spawn(BuzzerEvent::Alarm {
-                                i: Some(*cx.local.curr_al),
-                            })
-                            .unwrap();
-                            *state = MainState::Alarm;
-                            *cx.local.alarm_dur = Duration::ZERO;
-                        }
-                    }
-                }
-                MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
-                    *state = MainState::TimeDisplay;
-                }
-                _ => (),
-            },
-            MainState::Alarm => match ev {
-                MainEvent::PPSTick { dt, gps_lock: _ } => {
-                    *datetime = dt;
-                    *cx.local.alarm_dur += Duration::SECOND;
-                    if *cx.local.alarm_dur == ALARM_LEN {
-                        buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
-                        *state = MainState::TimeDisplay;
-                    }
-                }
-                MainEvent::LongButtonPress | MainEvent::ShortButtonPress => {
-                    buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
-                    *state = MainState::TimeDisplay;
-                }
-                _ => {}
-            },
             MainState::AlarmSetting => match ev {
                 MainEvent::PPSTick { dt: _, gps_lock: _ } => {}
                 MainEvent::LongButtonPress => {
@@ -1686,8 +1676,7 @@ mod app {
                     eeprom.lock(|eeprom| {
                         eeprom.write(2, hm).unwrap();
                     });
-                    *state = MainState::ColorSetting;
-                    buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
+                    *state = MainState::TimeDisplay;
                 }
                 MainEvent::ShortButtonPress => {
                     *cx.local.curr_al += 1;
@@ -1701,35 +1690,6 @@ mod app {
                 }
                 _ => (),
             },
-            MainState::ColorSetting => {
-                match ev {
-                    MainEvent::PPSTick { dt, gps_lock: _ } => {
-                        *datetime = dt;
-                        pps_tick_handler(dt, curr_mode);
-                        *cx.local.handle =
-                            main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
-                    }
-                    MainEvent::Timeout => {
-                        light::spawn(LightEvent::DIGITS {
-                            dg: None,
-                            col1: false,
-                            col2: false,
-                            mode: *curr_mode,
-                        })
-                        .unwrap();
-                    }
-                    MainEvent::ShortButtonPress => {}
-                    MainEvent::LongButtonPress => {
-                        if let Some(handle) = cx.local.handle.take() {
-                            handle.cancel().ok();
-                        }
-                        *state = MainState::TimeDisplay;
-                    }
-                }
-                if let Some(dt) = *datetime {
-                    disp_time(dt.time(), *curr_mode);
-                }
-            }
         }
     }
 
