@@ -152,6 +152,64 @@ mod app {
         }
     }
 
+    pub trait ColorMap {
+        fn get(&self, x: usize, y: usize) -> RGB8;
+    }
+
+    pub struct SolidColor {
+        color: RGB8,
+    }
+
+    impl SolidColor {
+        #[inline]
+        pub fn new(color: RGB8) -> Self {
+            Self { color }
+        }
+    }
+
+    impl ColorMap for SolidColor {
+        fn get(&self, _: usize, _: usize) -> RGB8 {
+            self.color
+        }
+    }
+
+    pub struct Gradient;
+
+    impl Gradient {
+        const LED_PALETTE_BRG: [RGB8; DIGIT_HEIGHT] = [
+            RGB8::new(254, 1, 0),
+            RGB8::new(224, 0, 31),
+            RGB8::new(192, 0, 63),
+            RGB8::new(160, 0, 95),
+            RGB8::new(128, 0, 127),
+            RGB8::new(96, 0, 159),
+            RGB8::new(64, 0, 191),
+            RGB8::new(32, 0, 223),
+            RGB8::new(0, 0, 255),
+        ];
+
+        #[inline]
+        pub fn new() -> Self {
+            Self {}
+        }
+    }
+
+    impl Default for Gradient {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl ColorMap for Gradient {
+        fn get(&self, _: usize, y: usize) -> RGB8 {
+            if y < Gradient::LED_PALETTE_BRG.len() {
+                Gradient::LED_PALETTE_BRG[y]
+            } else {
+                defmt::panic!();
+            }
+        }
+    }
+
     pub struct FireSim<const X: usize, const Y: usize> {
         pixels: [[u8; X]; Y],
         rng: Rand32,
@@ -159,30 +217,30 @@ mod app {
         c: usize,
     }
 
-    const FIRE_PALETTE: [RGB8; 20] = [
-        RGB8::new(5, 0, 0),
-        RGB8::new(30, 0, 0),
-        RGB8::new(79, 0, 0),
-        RGB8::new(116, 0, 0),
-        RGB8::new(150, 0, 0),
-        RGB8::new(186, 0, 0),
-        RGB8::new(221, 0, 0),
-        RGB8::new(255, 2, 0),
-        RGB8::new(255, 37, 0),
-        RGB8::new(255, 73, 0),
-        RGB8::new(255, 107, 0),
-        RGB8::new(255, 144, 0),
-        RGB8::new(255, 178, 0),
-        RGB8::new(255, 215, 0),
-        RGB8::new(255, 249, 0),
-        RGB8::new(255, 255, 46),
-        RGB8::new(255, 255, 97),
-        RGB8::new(255, 255, 153),
-        RGB8::new(255, 255, 204),
-        RGB8::new(255, 255, 255),
-    ];
-
     impl<const X: usize, const Y: usize> FireSim<X, Y> {
+        const FIRE_PALETTE: [RGB8; 20] = [
+            RGB8::new(5, 0, 0),
+            RGB8::new(30, 0, 0),
+            RGB8::new(79, 0, 0),
+            RGB8::new(116, 0, 0),
+            RGB8::new(150, 0, 0),
+            RGB8::new(186, 0, 0),
+            RGB8::new(221, 0, 0),
+            RGB8::new(255, 2, 0),
+            RGB8::new(255, 37, 0),
+            RGB8::new(255, 73, 0),
+            RGB8::new(255, 107, 0),
+            RGB8::new(255, 144, 0),
+            RGB8::new(255, 178, 0),
+            RGB8::new(255, 215, 0),
+            RGB8::new(255, 249, 0),
+            RGB8::new(255, 255, 46),
+            RGB8::new(255, 255, 97),
+            RGB8::new(255, 255, 153),
+            RGB8::new(255, 255, 204),
+            RGB8::new(255, 255, 255),
+        ];
+
         #[inline]
         fn new(seed: u64, slf: usize) -> Self {
             Self {
@@ -212,21 +270,24 @@ mod app {
                 }
 
                 for j in 1..X - 1 {
-                    let range = ((FIRE_PALETTE.len() - 15) as u32)..((FIRE_PALETTE.len() - 2) as u32);
+                    let range = ((Fire::FIRE_PALETTE.len() - 15) as u32)
+                        ..((Fire::FIRE_PALETTE.len() - 2) as u32);
                     self.pixels[0][j] = self.rng.rand_range(range) as u8;
                 }
             } else {
                 self.c += 1;
             }
         }
+    }
 
+    impl<const X: usize, const Y: usize> ColorMap for FireSim<X, Y> {
         fn get(&self, x: usize, y: usize) -> RGB8 {
-            let k = if (self.pixels[Y - y - 2][x + 1] as usize) < FIRE_PALETTE.len() {
+            let k = if (self.pixels[Y - y - 2][x + 1] as usize) < Fire::FIRE_PALETTE.len() {
                 self.pixels[Y - y - 2][x + 1]
             } else {
-                (FIRE_PALETTE.len() - 1) as u8
+                (Fire::FIRE_PALETTE.len() - 1) as u8
             };
-            FIRE_PALETTE[k as usize]
+            Fire::FIRE_PALETTE[k as usize]
         }
     }
 
@@ -237,11 +298,14 @@ mod app {
     type IrPin = PB0<Input<Floating>>;
     pub type IrReceiver = Receiver<Nec, IrPin, dwt_systick_monotonic::fugit::Instant<u32, 1, FREQ>>;
 
-    const SEG_LEN: usize = (5 * 4) + 5 + 3;
+    const DIGIT_LEN: usize = (5 * 4) + 5 + 3;
+    const DIGIT_WIDTH: usize = 6;
+    const DIGIT_HEIGHT: usize = 9;
+    const NUM_DIGITS: usize = 6;
     const COLON_LEN: usize = 4;
     const NUM_SEGS: usize = 7;
     const BUFF_SIZE: usize = 512;
-    const NUM_LEDS: usize = (SEG_LEN * 6) + (2 * COLON_LEN);
+    const NUM_LEDS: usize = (DIGIT_LEN * 6) + (2 * COLON_LEN);
     const LEDS_BUF_SIZE: usize = 2 * 2048;
     const LED_FADE_MAX: u8 = 150;
     const LED_FADE_SLOPE: usize = 5;
@@ -259,7 +323,7 @@ mod app {
         page_count: 2,
     };
 
-    const LED_POS_TO_XY: [(u8, u8); SEG_LEN] = [
+    const LED_POS_TO_XY: [(u8, u8); DIGIT_LEN] = [
         (4, 4),
         (3, 4),
         (2, 4),
@@ -290,16 +354,15 @@ mod app {
         (0, 5),
     ];
 
-    const LED_PALETTE_BRG: [RGB8; 9] = [
-        RGB8::new(0, 0, 128),
-        RGB8::new(0, 0, 255),
-        RGB8::new(0, 128, 255),
-        RGB8::new(22, 255, 225),
-        RGB8::new(125, 255, 122),
-        RGB8::new(228, 255, 19),
-        RGB8::new(255, 148, 0),
-        RGB8::new(255, 30, 0),
-        RGB8::new(128, 0, 0),
+    const COLON_POS_TO_XY: [(u8, u8); 2 * COLON_LEN] = [
+        (13, 2),
+        (14, 2),
+        (13, 6),
+        (14, 6),
+        (23, 2),
+        (24, 2),
+        (23, 6),
+        (24, 6),
     ];
 
     const SYMBOL_TO_SEGS: [u8; 10] = [
@@ -357,21 +420,29 @@ mod app {
         247, 249, 252, 255,
     ];
 
+    #[derive(Debug, PartialEq)]
+    #[allow(non_camel_case_types)]
+    pub enum LightMode {
+        SOLID_COLOR { color: RGB8 },
+        GRADIENT,
+        FIRE,
+    }
+
     #[derive(Debug)]
     #[allow(non_camel_case_types)]
     pub enum LightEvent {
         DIGITS {
-            dg: Option<[char; 6]>,
+            dg: Option<[char; NUM_DIGITS]>,
             col1: bool,
             col2: bool,
-            color: Option<RGB8>,
+            mode: LightMode,
         },
         TIMEOUT,
     }
 
     #[derive(PartialEq)]
     #[allow(non_camel_case_types)]
-    pub enum LightTickMode {
+    pub enum OperatingMode {
         DAY,
         NIGHT,
         SUNRISE { ramp: LinearRamp },
@@ -407,6 +478,7 @@ mod app {
     >;
 
     type Xfer = Transfer<stm32f1xx_hal::dma::R, &'static [u8; LEDS_BUF_SIZE], Leds>;
+    type Fire = FireSim<{ (DIGIT_WIDTH * NUM_DIGITS) + 2 + 2 + 2 }, { DIGIT_HEIGHT + 2 }>;
 
     #[local]
     struct Local {
@@ -424,7 +496,9 @@ mod app {
         alarm_time: Time,
         leds: [RGB8; NUM_LEDS],
         receiver: IrReceiver,
-        fire: FireSim<{ 40 + 2 }, { 9 + 2 }>,
+        fire: Fire,
+        gradient: Gradient,
+        solid: SolidColor,
     }
 
     #[init(local = [flash: Option<Parts> = None,
@@ -561,6 +635,8 @@ mod app {
         buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
 
         let fire = FireSim::new(666, 7);
+        let gradient = Gradient::new();
+        let solid = SolidColor::new(DEFAULT_LED_COLOR);
 
         (
             Shared {
@@ -585,6 +661,8 @@ mod app {
                 leds,
                 receiver,
                 fire,
+                gradient,
+                solid,
             },
             init::Monotonics(mono),
         )
@@ -894,10 +972,12 @@ mod app {
 
     #[task(local = [ws, leds, is_trans: bool = false,
                     fire,
+                    gradient,
+                    solid,
+                    mode: LightMode = LightMode::GRADIENT,
                     xfer: Option<Xfer> = None,
-                    prev_dg: [char; 6] = [' '; 6],
-                    curr_color: Option<RGB8> = None,
-                    trans_state: [[LightTransition; NUM_SEGS]; 6] = [[LightTransition::Finished {state: false}; NUM_SEGS]; 6],
+                    prev_dg: [char; NUM_DIGITS] = [' '; NUM_DIGITS],
+                    trans_state: [[LightTransition; NUM_SEGS]; NUM_DIGITS] = [[LightTransition::Finished {state: false}; NUM_SEGS]; NUM_DIGITS],
                     handle: Option<light::SpawnHandle> = None],
                         priority = 8, capacity = 3)]
     fn light(cx: light::Context, ev: LightEvent) {
@@ -908,7 +988,6 @@ mod app {
         let prev_dg = cx.local.prev_dg;
         let trans_state = cx.local.trans_state;
         let handle = cx.local.handle;
-        let curr_color = cx.local.curr_color;
         let fire = cx.local.fire;
 
         match ev {
@@ -916,7 +995,7 @@ mod app {
                 dg,
                 col1,
                 col2,
-                color,
+                mode,
             } => {
                 // if *is_trans {
                 //     if let Some(handle) = handle.take() {
@@ -946,8 +1025,8 @@ mod app {
                             }
                         }
                     }
+                    *cx.local.mode = mode;
                     *prev_dg = dg;
-                    *curr_color = color;
                     defmt::info!("Transition started");
                     if !*is_trans {
                         *is_trans = true;
@@ -956,22 +1035,33 @@ mod app {
                     }
                 }
 
+                let cmap: &dyn ColorMap = match *cx.local.mode {
+                    LightMode::GRADIENT => cx.local.gradient,
+                    LightMode::SOLID_COLOR { color } => {
+                        *cx.local.solid = SolidColor::new(color);
+                        cx.local.solid
+                    }
+                    LightMode::FIRE => fire,
+                };
+
                 if col1 {
-                    leds_draw_colon(leds, 0, LED_FADE_MAX, color.unwrap_or(DEFAULT_LED_COLOR));
+                    leds_draw_colon(leds, 0, LED_FADE_MAX, cmap);
                 } else {
-                    leds_draw_colon(leds, 0, 0, RGB8::default());
+                    leds_draw_colon(leds, 0, 0, cmap);
                 }
                 if col2 {
-                    leds_draw_colon(leds, 1, LED_FADE_MAX, color.unwrap_or(DEFAULT_LED_COLOR));
+                    leds_draw_colon(leds, 1, LED_FADE_MAX, cmap);
                 } else {
-                    leds_draw_colon(leds, 1, 0, RGB8::default());
+                    leds_draw_colon(leds, 1, 0, cmap);
                 }
                 unsafe {
                     leds_write(&mut LEDS_BUF, leds, cx.local.xfer, ws);
                 }
             }
             LightEvent::TIMEOUT => {
-                fire.update();
+                if *cx.local.mode == LightMode::FIRE {
+                    fire.update();
+                }
 
                 defmt::assert!(*is_trans);
                 for d in (*trans_state).iter_mut() {
@@ -980,9 +1070,15 @@ mod app {
                     }
                 }
 
+                let cmap: &dyn ColorMap = match *cx.local.mode {
+                    LightMode::GRADIENT => cx.local.gradient,
+                    LightMode::SOLID_COLOR { .. } => cx.local.solid,
+                    LightMode::FIRE => fire,
+                };
+
                 for (x, d) in (*trans_state).iter().rev().enumerate() {
                     let segs: [u8; NUM_SEGS] = d.map(transition_to_brightness);
-                    leds_draw_digit(leds, x, segs, *curr_color, fire);
+                    leds_draw_digit(leds, x, segs, cmap);
                 }
                 unsafe {
                     leds_write(&mut LEDS_BUF, leds, cx.local.xfer, ws);
@@ -1467,29 +1563,26 @@ mod app {
         leds: &mut [RGB8; NUM_LEDS],
         x: usize,
         segs: [u8; NUM_SEGS],
-        color: Option<RGB8>,
-        fire: &FireSim<{ 40 + 2 }, { 9 + 2 }>,
+        cmap: &dyn ColorMap,
     ) {
-        let dx = x * SEG_LEN + (COLON_LEN * (x / 2));
-        let dd = 6 * x;
+        let dx = x * DIGIT_LEN + (COLON_LEN * (x / 2));
+        let ddx = NUM_DIGITS * x;
         for (i, s) in segs.iter().enumerate() {
             let (o, l) = SEG_TO_OFFSET[i];
             for (i, l) in leds.iter_mut().skip(dx + o).take(l).enumerate() {
-                let c = if let Some(c) = color {
-                    c
-                } else {
-                    let (x, y) = LED_POS_TO_XY[o + i];
-                    fire.get(dd + x as usize, y as usize)
-                };
+                let (x, y) = LED_POS_TO_XY[o + i];
+                let c = cmap.get(ddx + x as usize, y as usize);
                 *l = dim_color(c, *s);
             }
         }
     }
 
-    fn leds_draw_colon(leds: &mut [RGB8; NUM_LEDS], x: usize, b: u8, color: RGB8) {
-        let offset = 2 * SEG_LEN + ((2 * SEG_LEN) + COLON_LEN) * x;
-        for l in leds.iter_mut().skip(offset).take(COLON_LEN) {
-            *l = dim_color(color, b);
+    fn leds_draw_colon(leds: &mut [RGB8; NUM_LEDS], x: usize, b: u8, cmap: &dyn ColorMap) {
+        let offset = 2 * DIGIT_LEN + ((2 * DIGIT_LEN) + COLON_LEN) * x;
+        for (i, l) in leds.iter_mut().skip(offset).take(COLON_LEN).enumerate() {
+            let (x, y) = COLON_POS_TO_XY[(x * COLON_LEN) + i];
+            let c = cmap.get(x as usize, y as usize);
+            *l = dim_color(c, b);
         }
     }
 
@@ -1538,12 +1631,12 @@ mod app {
 
     fn pps_tick_handler(
         dt: Option<PrimitiveDateTime>,
-        mode: &mut LightTickMode,
+        mode: &mut OperatingMode,
         alarm_dur: &mut Duration,
     ) {
         if let Some(dt) = dt {
             let s = dt.time().second();
-            if *mode == LightTickMode::DAY {
+            if *mode == OperatingMode::DAY {
                 match dt.time().minute() {
                     0 => {
                         if s == 0 {
@@ -1566,17 +1659,17 @@ mod app {
 
             let h = dt.time().hour();
             match *mode {
-                LightTickMode::DAY => {
+                OperatingMode::DAY => {
                     if !(7..=21).contains(&h) {
-                        *mode = LightTickMode::NIGHT;
+                        *mode = OperatingMode::NIGHT;
                     }
                 }
-                LightTickMode::NIGHT => {
+                OperatingMode::NIGHT => {
                     if (7..=21).contains(&h) {
-                        *mode = LightTickMode::DAY;
+                        *mode = OperatingMode::DAY;
                     }
                 }
-                LightTickMode::ALARM => {
+                OperatingMode::ALARM => {
                     *alarm_dur += Duration::SECOND;
                     if *alarm_dur == ALARM_LEN {
                         buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
@@ -1587,9 +1680,9 @@ mod app {
         }
     }
 
-    fn disp_time(time: Time, mode: &mut LightTickMode, alarm_dur: &mut Duration) {
+    fn disp_time(time: Time, mode: &mut OperatingMode, alarm_dur: &mut Duration) {
         let (h, m, s) = time.as_hms();
-        let mut buf: String<6> = String::new();
+        let mut buf: String<NUM_DIGITS> = String::new();
         buf.write_fmt(format_args!("{:02}{:02}{:02}", h, m, s))
             .unwrap();
         let mut dg = str_to_array(&buf);
@@ -1597,37 +1690,39 @@ mod app {
             dg[0] = ' ';
         }
 
-        let color = match mode {
-            LightTickMode::DAY => None,
-            LightTickMode::NIGHT => Some(
-                DEFAULT_LED_COLOR
+        let lmode = match mode {
+            OperatingMode::DAY => LightMode::FIRE,
+            OperatingMode::NIGHT => LightMode::SOLID_COLOR {
+                color: DEFAULT_LED_COLOR
                     .iter()
                     .map(|v| ((v as usize) * (GAMMA8[60] as usize) / 255) as u8)
                     .collect(),
-            ),
-            LightTickMode::SUNRISE { ramp } => {
+            },
+            OperatingMode::SUNRISE { ramp } => {
                 if let Some(y) = ramp.next() {
                     let rgb = SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()].to_be_bytes()
                         [1..4]
                         .iter()
                         .map(|v| GAMMA8[*v as usize])
                         .collect::<Vec<_, 3>>();
-                    Some(RGB8::new(rgb[0], rgb[1], rgb[2]) / 4)
+                    LightMode::SOLID_COLOR {
+                        color: RGB8::new(rgb[0], rgb[1], rgb[2]) / 4,
+                    }
                 } else {
                     buzzer::spawn(BuzzerEvent::Alarm { i: Some(0) }).unwrap();
-                    *mode = LightTickMode::ALARM;
+                    *mode = OperatingMode::ALARM;
                     *alarm_dur = Duration::ZERO;
-                    None
+                    LightMode::GRADIENT
                 }
             }
-            _ => None,
+            _ => LightMode::GRADIENT,
         };
 
         light::spawn(LightEvent::DIGITS {
             dg: Some(dg),
             col1: true,
             col2: true,
-            color,
+            mode: lmode,
         })
         .unwrap();
     }
@@ -1640,7 +1735,7 @@ mod app {
                                  curr_al: usize = 0,
                                  state: MainState = MainState::NoSync {s: true},
                                  handle: Option<main_sm::SpawnHandle> = None,
-                                 mode: LightTickMode = LightTickMode::DAY,
+                                 mode: OperatingMode = OperatingMode::DAY,
                                  alarm_enabled,
                                  alarm_time,
                                  alarm_dur: Duration = Duration::ZERO,
@@ -1661,16 +1756,16 @@ mod app {
                             dg: Some(str_to_array("noSync")),
                             col1: false,
                             col2: false,
-                            color: None,
+                            mode: LightMode::GRADIENT,
                         })
                         .unwrap();
                         *state = MainState::NoSync { s: false };
                     } else {
                         light::spawn(LightEvent::DIGITS {
-                            dg: Some([' '; 6]),
+                            dg: Some([' '; NUM_DIGITS]),
                             col1: false,
                             col2: false,
-                            color: None,
+                            mode: LightMode::GRADIENT,
                         })
                         .unwrap();
                         *state = MainState::NoSync { s: true };
@@ -1698,7 +1793,7 @@ mod app {
                             && dt.time() == (*alarm_time - SUNRISE_LEN)
                         {
                             defmt::info!("Starting sunrise");
-                            *curr_mode = LightTickMode::SUNRISE {
+                            *curr_mode = OperatingMode::SUNRISE {
                                 ramp: LinearRamp::new(
                                     SUNRISE_LEN.whole_seconds().try_into().unwrap(),
                                     SUNRISE_CMAP.len(),
@@ -1716,7 +1811,7 @@ mod app {
                         dg: None,
                         col1: false,
                         col2: false,
-                        color: None,
+                        mode: LightMode::GRADIENT,
                     })
                     .unwrap();
                 }
