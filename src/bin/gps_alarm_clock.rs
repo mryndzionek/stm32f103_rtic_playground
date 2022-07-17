@@ -152,6 +152,81 @@ mod app {
         }
     }
 
+    pub struct FireSim<const X: usize, const Y: usize> {
+        pixels: [[u8; X]; Y],
+        rng: Rand32,
+        slf: usize,
+        c: usize,
+    }
+
+    const FIRE_PALETTE: [RGB8; 20] = [
+        RGB8::new(5, 0, 0),
+        RGB8::new(30, 0, 0),
+        RGB8::new(79, 0, 0),
+        RGB8::new(116, 0, 0),
+        RGB8::new(150, 0, 0),
+        RGB8::new(186, 0, 0),
+        RGB8::new(221, 0, 0),
+        RGB8::new(255, 2, 0),
+        RGB8::new(255, 37, 0),
+        RGB8::new(255, 73, 0),
+        RGB8::new(255, 107, 0),
+        RGB8::new(255, 144, 0),
+        RGB8::new(255, 178, 0),
+        RGB8::new(255, 215, 0),
+        RGB8::new(255, 249, 0),
+        RGB8::new(255, 255, 46),
+        RGB8::new(255, 255, 97),
+        RGB8::new(255, 255, 153),
+        RGB8::new(255, 255, 204),
+        RGB8::new(255, 255, 255),
+    ];
+
+    impl<const X: usize, const Y: usize> FireSim<X, Y> {
+        #[inline]
+        fn new(seed: u64, slf: usize) -> Self {
+            Self {
+                pixels: [[0; X]; Y],
+                rng: Rand32::new(seed),
+                slf,
+                c: 0,
+            }
+        }
+
+        fn update(&mut self) {
+            if self.c == self.slf {
+                self.c = 0;
+                for i in (1..Y - 1).rev() {
+                    for j in 1..X - 1 {
+                        let mut n = 0;
+
+                        let decay = self.rng.rand_range(2..3) as u8;
+                        if self.pixels[i - 1][j] > decay {
+                            n = self.pixels[i - 1][j] - decay;
+                        }
+                        self.pixels[i][j] = n;
+                    }
+                }
+
+                for j in 1..X - 1 {
+                    let range = ((FIRE_PALETTE.len() - 15) as u32)..((FIRE_PALETTE.len()) as u32);
+                    self.pixels[0][j] = self.rng.rand_range(range) as u8;
+                }
+            } else {
+                self.c += 1;
+            }
+        }
+
+        fn get(&self, x: usize, y: usize) -> RGB8 {
+            let k = if (self.pixels[Y - y - 2][x + 1] as usize) < FIRE_PALETTE.len() {
+                self.pixels[Y - y - 2][x + 1]
+            } else {
+                (FIRE_PALETTE.len() - 1) as u8
+            };
+            FIRE_PALETTE[k as usize]
+        }
+    }
+
     const FREQ: u32 = 72_000_000;
     #[monotonic(binds = SysTick, default = true)]
     type MyMono = DwtSystick<FREQ>;
@@ -163,8 +238,6 @@ mod app {
     const COLON_LEN: usize = 4;
     const NUM_SEGS: usize = 7;
     const BUFF_SIZE: usize = 512;
-    const LED_ROWS: usize = 8;
-    const LED_COLS: usize = 16;
     const NUM_LEDS: usize = (SEG_LEN * 6) + (2 * COLON_LEN);
     const LEDS_BUF_SIZE: usize = 2 * 2048;
     const LED_FADE_MAX: u8 = 150;
@@ -215,15 +288,15 @@ mod app {
     ];
 
     const LED_PALETTE_BRG: [RGB8; 9] = [
-        RGB8::new(254, 1, 0),
-        RGB8::new(224, 0, 31),
-        RGB8::new(192, 0, 63),
-        RGB8::new(160, 0, 95),
-        RGB8::new(128, 0, 127),
-        RGB8::new(96, 0, 159),
-        RGB8::new(64, 0, 191),
-        RGB8::new(32, 0, 223),
+        RGB8::new(0, 0, 128),
         RGB8::new(0, 0, 255),
+        RGB8::new(0, 128, 255),
+        RGB8::new(22, 255, 225),
+        RGB8::new(125, 255, 122),
+        RGB8::new(228, 255, 19),
+        RGB8::new(255, 148, 0),
+        RGB8::new(255, 30, 0),
+        RGB8::new(128, 0, 0),
     ];
 
     const SYMBOL_TO_SEGS: [u8; 10] = [
@@ -344,11 +417,11 @@ mod app {
         dst: Duration,
         buzz_pwm: Pwm<TIM3, Tim3NoRemap, C1, stm32f1xx_hal::gpio::gpioa::PA6<Alternate<PushPull>>>,
         wdg: IndependentWatchdog,
-        rng: Rand32,
         alarm_enabled: bool,
         alarm_time: Time,
         leds: [RGB8; NUM_LEDS],
         receiver: IrReceiver,
+        fire: FireSim<{ 40 + 2 }, { 9 + 2 }>,
     }
 
     #[init(local = [flash: Option<Parts> = None,
@@ -484,6 +557,8 @@ mod app {
         main_sm::spawn(MainEvent::Timeout).unwrap();
         buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
 
+        let fire = FireSim::new(666, 5);
+
         (
             Shared {
                 datetime: None,
@@ -502,11 +577,11 @@ mod app {
                 dst,
                 buzz_pwm,
                 wdg,
-                rng: Rand32::new(666),
                 alarm_enabled,
                 alarm_time,
                 leds,
                 receiver,
+                fire,
             },
             init::Monotonics(mono),
         )
@@ -815,6 +890,7 @@ mod app {
     }
 
     #[task(local = [ws, leds, is_trans: bool = false,
+                    fire,
                     xfer: Option<Xfer> = None,
                     prev_dg: [char; 6] = [' '; 6],
                     curr_color: Option<RGB8> = None,
@@ -830,6 +906,7 @@ mod app {
         let trans_state = cx.local.trans_state;
         let handle = cx.local.handle;
         let curr_color = cx.local.curr_color;
+        let fire = cx.local.fire;
 
         match ev {
             LightEvent::DIGITS {
@@ -838,11 +915,11 @@ mod app {
                 col2,
                 color,
             } => {
-                if *is_trans {
-                    if let Some(handle) = handle.take() {
-                        handle.cancel().ok();
-                    }
-                }
+                // if *is_trans {
+                //     if let Some(handle) = handle.take() {
+                //         handle.cancel().ok();
+                //     }
+                // }
                 if let Some(dg) = dg {
                     for (i, (d, pd)) in dg.iter().zip((*prev_dg).iter()).enumerate() {
                         let (sd, psd) = (char_to_segs(*d), char_to_segs(*pd));
@@ -866,11 +943,14 @@ mod app {
                             }
                         }
                     }
-                    *is_trans = true;
                     *prev_dg = dg;
                     *curr_color = color;
                     defmt::info!("Transition started");
-                    *handle = light::spawn_after(LED_FADE_SPEED.millis(), LightEvent::TIMEOUT).ok();
+                    if !*is_trans {
+                        *is_trans = true;
+                        *handle =
+                            light::spawn_after(LED_FADE_SPEED.millis(), LightEvent::TIMEOUT).ok();
+                    }
                 }
 
                 if col1 {
@@ -888,6 +968,8 @@ mod app {
                 }
             }
             LightEvent::TIMEOUT => {
+                fire.update();
+
                 defmt::assert!(*is_trans);
                 for d in (*trans_state).iter_mut() {
                     for s in d.iter_mut() {
@@ -897,21 +979,12 @@ mod app {
 
                 for (x, d) in (*trans_state).iter().rev().enumerate() {
                     let segs: [u8; NUM_SEGS] = d.map(transition_to_brightness);
-                    leds_draw_digit(leds, x, segs, *curr_color);
+                    leds_draw_digit(leds, x, segs, *curr_color, fire);
                 }
                 unsafe {
                     leds_write(&mut LEDS_BUF, leds, cx.local.xfer, ws);
                 }
-
-                if !(*trans_state).iter().all(|x| {
-                    x.iter()
-                        .all(|y| matches!(y, LightTransition::Finished { .. }))
-                }) {
-                    *handle = light::spawn_after(LED_FADE_SPEED.millis(), LightEvent::TIMEOUT).ok();
-                } else {
-                    *is_trans = false;
-                    defmt::info!("Transition finished");
-                }
+                *handle = light::spawn_after(LED_FADE_SPEED.millis(), LightEvent::TIMEOUT).ok();
             }
         }
     }
@@ -1392,16 +1465,18 @@ mod app {
         x: usize,
         segs: [u8; NUM_SEGS],
         color: Option<RGB8>,
+        fire: &FireSim<{ 40 + 2 }, { 9 + 2 }>,
     ) {
         let dx = x * SEG_LEN + (COLON_LEN * (x / 2));
+        let dd = 6 * x;
         for (i, s) in segs.iter().enumerate() {
             let (o, l) = SEG_TO_OFFSET[i];
             for (i, l) in leds.iter_mut().skip(dx + o).take(l).enumerate() {
                 let c = if let Some(c) = color {
                     c
                 } else {
-                    let (_, y) = LED_POS_TO_XY[o + i];
-                    LED_PALETTE_BRG[y as usize]
+                    let (x, y) = LED_POS_TO_XY[o + i];
+                    fire.get(dd + x as usize, y as usize)
                 };
                 *l = dim_color(c, *s);
             }
@@ -1562,8 +1637,6 @@ mod app {
                                  curr_al: usize = 0,
                                  state: MainState = MainState::NoSync {s: true},
                                  handle: Option<main_sm::SpawnHandle> = None,
-                                 rng,
-                                 bmp: [[u16; LED_COLS + 2]; LED_ROWS + 2] = [[0; LED_COLS + 2]; LED_ROWS + 2],
                                  mode: LightTickMode = LightTickMode::DAY,
                                  alarm_enabled,
                                  alarm_time,
