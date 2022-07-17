@@ -200,16 +200,19 @@ mod app {
                     for j in 1..X - 1 {
                         let mut n = 0;
 
-                        let decay = self.rng.rand_range(2..3) as u8;
+                        let decay = self.rng.rand_range(2..4) as u8;
                         if self.pixels[i - 1][j] > decay {
                             n = self.pixels[i - 1][j] - decay;
+                        }
+                        if self.rng.rand_range(0..100) == 0 {
+                            n += 8;
                         }
                         self.pixels[i][j] = n;
                     }
                 }
 
                 for j in 1..X - 1 {
-                    let range = ((FIRE_PALETTE.len() - 15) as u32)..((FIRE_PALETTE.len()) as u32);
+                    let range = ((FIRE_PALETTE.len() - 15) as u32)..((FIRE_PALETTE.len() - 2) as u32);
                     self.pixels[0][j] = self.rng.rand_range(range) as u8;
                 }
             } else {
@@ -557,7 +560,7 @@ mod app {
         main_sm::spawn(MainEvent::Timeout).unwrap();
         buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
 
-        let fire = FireSim::new(666, 5);
+        let fire = FireSim::new(666, 7);
 
         (
             Shared {
