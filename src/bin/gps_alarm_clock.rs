@@ -24,9 +24,8 @@ mod app {
     use smart_leds::RGB8;
     use stm32f103_rtic_playground as _;
     use stm32f1xx_hal::gpio::{
-        gpioa::{PA1, PA4},
-        gpioc::PC13,
-        Alternate, Edge, ExtiPin, Floating, Input, Output, PullDown, PushPull,
+        gpioa::PA1, gpiob::PB0, gpioc::PC13, Alternate, Edge, ExtiPin, Floating, Input, Output,
+        PullDown, PushPull,
     };
     use stm32f1xx_hal::watchdog::IndependentWatchdog;
     use stm32f1xx_hal::{
@@ -157,7 +156,7 @@ mod app {
     #[monotonic(binds = SysTick, default = true)]
     type MyMono = DwtSystick<FREQ>;
 
-    type IrPin = PA4<Input<Floating>>;
+    type IrPin = PB0<Input<Floating>>;
     pub type IrReceiver = Receiver<Nec, IrPin, dwt_systick_monotonic::fugit::Instant<u32, 1, FREQ>>;
 
     const SEG_LEN: usize = (5 * 4) + 5 + 3;
@@ -474,10 +473,10 @@ mod app {
         );
         buzz_pwm.set_duty(Channel::C1, 10 * (buzz_pwm.get_max_duty() / 100));
 
-        let mut pin = gpioa.pa4.into_floating_input(&mut gpioa.crl);
+        let mut pin = gpiob.pb0.into_floating_input(&mut gpiob.crl);
         pin.make_interrupt_source(&mut afio);
-        pin.trigger_on_edge(&c.device.EXTI, Edge::RisingFalling);
         pin.enable_interrupt(&c.device.EXTI);
+        pin.trigger_on_edge(&c.device.EXTI, Edge::RisingFalling);
 
         let receiver = Receiver::with_fugit(pin);
 
@@ -1428,18 +1427,19 @@ mod app {
         ShortPressWait,
     }
 
-    #[task(binds = EXTI4, shared = [],
-        local = [receiver], priority = 2)]
+    #[task(binds = EXTI0, shared = [],
+        local = [receiver], priority = 16)]
     fn ir_isr(cx: ir_isr::Context) {
-        let receiver = cx.local.receiver;
         let now = monotonics::now();
+        let receiver = cx.local.receiver;
+        if receiver.pin_mut().check_interrupt() {
+            if let Ok(Some(cmd)) = receiver.event_instant(now) {
+                buzzer::spawn(BuzzerEvent::SecondTick).ok();
+                defmt::error!("Cmd: {:?}", Debug2Format(&cmd));
+            }
 
-        //defmt::error!("xxx {}", now.ticks());
-        if let Ok(Some(cmd)) = receiver.event_instant(now) {
-            defmt::error!("Cmd: {:?}", Debug2Format(&cmd));
+            receiver.pin_mut().clear_interrupt_pending_bit();
         }
-
-        receiver.pin_mut().clear_interrupt_pending_bit();
     }
     pub enum MainState {
         NoSync { s: bool },
