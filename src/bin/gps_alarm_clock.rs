@@ -13,7 +13,11 @@ mod app {
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
     use eeprom::{EEPROMExt, Params, EEPROM};
     use heapless::{String, Vec};
+    use infrared::protocol::nec::NecCommand;
     use infrared::protocol::Nec;
+    use infrared::remotecontrol::Action::*;
+    use infrared::remotecontrol::{Action, Button, DeviceType, RemoteControlModel};
+    use infrared::ProtocolId;
     use infrared::Receiver;
     use nmea0183::{
         coords::{Hemisphere, Latitude, Longitude},
@@ -41,6 +45,40 @@ mod app {
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
 
+    #[derive(Debug, Default)]
+    pub struct Mp3Remote;
+
+    impl RemoteControlModel for Mp3Remote {
+        const MODEL: &'static str = "Special for Mp3";
+        const DEVTYPE: DeviceType = DeviceType::Generic;
+        const PROTOCOL: ProtocolId = ProtocolId::Nec;
+        const ADDRESS: u32 = 0;
+        type Cmd = NecCommand;
+
+        const BUTTONS: &'static [(u32, Action)] = &[
+            (69, ChannelListPrev),
+            (70, ChannelList),
+            (71, ChannelListNext),
+            (68, Prev),
+            (64, Next),
+            (67, Play_Pause),
+            (7, VolumeDown),
+            (21, VolumeUp),
+            (9, Eq),
+            (22, Zero),
+            (25, Up),
+            (13, Down),
+            (12, One),
+            (24, Two),
+            (94, Three),
+            (8, Four),
+            (28, Five),
+            (90, Six),
+            (66, Seven),
+            (82, Eight),
+            (74, Nine),
+        ];
+    }
     struct HemisphereWrapper(Hemisphere);
     impl Format for HemisphereWrapper {
         fn format(&self, fmt: Formatter) {
@@ -281,7 +319,7 @@ mod app {
                     for j in 1..X - 1 {
                         let mut n = 0;
 
-                        let decay = self.rng.rand_range(4..6) as u8;
+                        let decay = self.rng.rand_range(4..5) as u8;
                         if self.pixels[i - 1][j] > decay {
                             n = self.pixels[i - 1][j] - decay;
                         }
@@ -307,7 +345,7 @@ mod app {
         fn get(&self, x: usize, y: usize) -> RGB8 {
             let (y, x) = (Y - y - 2, x + 1);
             let (p1, p2) = (self.pixels[y][x] as i16, self.prev_pixels[y][x] as i16);
-            let r = (self.c as i16) * (p1 - p2) / ((self.slf as i16));
+            let r = (self.c as i16) * (p1 - p2) / (self.slf as i16);
             let mut p = self.prev_pixels[y][x] as i16 + r;
             if p < 0 {
                 p = 0;
@@ -326,7 +364,12 @@ mod app {
     type MyMono = DwtSystick<FREQ>;
 
     type IrPin = PB0<Input<Floating>>;
-    pub type IrReceiver = Receiver<Nec, IrPin, dwt_systick_monotonic::fugit::Instant<u32, 1, FREQ>>;
+    pub type IrReceiver = Receiver<
+        Nec,
+        IrPin,
+        dwt_systick_monotonic::fugit::Instant<u32, 1, FREQ>,
+        Button<Mp3Remote>,
+    >;
 
     const DIGIT_LEN: usize = (5 * 4) + 5 + 3;
     const DIGIT_WIDTH: usize = 6;
@@ -450,7 +493,7 @@ mod app {
         247, 249, 252, 255,
     ];
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Clone)]
     #[allow(non_camel_case_types)]
     pub enum LightMode {
         SOLID_COLOR { color: RGB8 },
@@ -473,7 +516,7 @@ mod app {
     #[derive(PartialEq)]
     #[allow(non_camel_case_types)]
     pub enum OperatingMode {
-        DAY,
+        DAY { mode: LightMode },
         NIGHT,
         SUNRISE { ramp: LinearRamp },
         ALARM,
@@ -651,7 +694,7 @@ mod app {
             &mut afio.mapr,
             BUZZER_BASE_FREQ_HZ.hz(),
         );
-        buzz_pwm.set_duty(Channel::C1, 10 * (buzz_pwm.get_max_duty() / 100));
+        buzz_pwm.set_duty(Channel::C1, 1 * (buzz_pwm.get_max_duty() / 100));
 
         let mut pin = gpiob.pb0.into_floating_input(&mut gpiob.crl);
         pin.make_interrupt_source(&mut afio);
@@ -1635,8 +1678,18 @@ mod app {
         let receiver = cx.local.receiver;
         if receiver.pin_mut().check_interrupt() {
             if let Ok(Some(cmd)) = receiver.event_instant(now) {
-                buzzer::spawn(BuzzerEvent::SecondTick).ok();
-                defmt::error!("Cmd: {:?}", Debug2Format(&cmd));
+                if let Some(action) = cmd.action() {
+                    match action {
+                        One | Two | Three | Four | Five | Six | Seven | Eight | Nine | Zero => {
+                            if !cmd.is_repeat() {
+                                main_sm::spawn(MainEvent::Remote { btn: action }).unwrap();
+                            }
+                        }
+                        _ => {
+                            main_sm::spawn(MainEvent::Remote { btn: action }).unwrap();
+                        }
+                    }
+                }
             }
 
             receiver.pin_mut().clear_interrupt_pending_bit();
@@ -1655,8 +1708,9 @@ mod app {
             dt: Option<PrimitiveDateTime>,
             gps_lock: bool,
         },
-        ShortButtonPress,
-        LongButtonPress,
+        Remote {
+            btn: Action,
+        },
     }
 
     fn pps_tick_handler(
@@ -1666,8 +1720,8 @@ mod app {
     ) {
         if let Some(dt) = dt {
             let s = dt.time().second();
-            if *mode == OperatingMode::DAY {
-                match dt.time().minute() {
+            match *mode {
+                OperatingMode::DAY { .. } => match dt.time().minute() {
                     0 => {
                         if s == 0 {
                             buzzer::spawn(BuzzerEvent::HourChime).unwrap();
@@ -1684,21 +1738,11 @@ mod app {
                         }
                     }
                     _ => (),
-                }
+                },
+                _ => {}
             }
 
-            let h = dt.time().hour();
             match *mode {
-                OperatingMode::DAY => {
-                    if !(7..=21).contains(&h) {
-                        *mode = OperatingMode::NIGHT;
-                    }
-                }
-                OperatingMode::NIGHT => {
-                    if (7..=21).contains(&h) {
-                        *mode = OperatingMode::DAY;
-                    }
-                }
                 OperatingMode::ALARM => {
                     *alarm_dur += Duration::SECOND;
                     if *alarm_dur == ALARM_LEN {
@@ -1721,7 +1765,7 @@ mod app {
         }
 
         let lmode = match mode {
-            OperatingMode::DAY => LightMode::FIRE,
+            OperatingMode::DAY { mode } => mode.clone(),
             OperatingMode::NIGHT => LightMode::SOLID_COLOR {
                 color: DEFAULT_LED_COLOR
                     .iter()
@@ -1765,7 +1809,7 @@ mod app {
                                  curr_al: usize = 0,
                                  state: MainState = MainState::NoSync {s: true},
                                  handle: Option<main_sm::SpawnHandle> = None,
-                                 mode: OperatingMode = OperatingMode::DAY,
+                                 mode: OperatingMode = OperatingMode::DAY {mode: LightMode::GRADIENT},
                                  alarm_enabled,
                                  alarm_time,
                                  alarm_dur: Duration = Duration::ZERO,
@@ -1845,50 +1889,109 @@ mod app {
                     })
                     .unwrap();
                 }
-                MainEvent::LongButtonPress => {
-                    if let Some(handle) = cx.local.handle.take() {
-                        handle.cancel().ok();
+                MainEvent::Remote { btn } => match btn {
+                    One => {
+                        if let Some(handle) = cx.local.handle.take() {
+                            handle.cancel().ok();
+                        }
+                        disp_time(*alarm_time, curr_mode, cx.local.alarm_dur);
+                        buzzer::spawn(BuzzerEvent::Alarm {
+                            i: Some(*cx.local.curr_al),
+                        })
+                        .unwrap();
+                        *state = MainState::AlarmSetting;
                     }
-                    disp_time(*alarm_time, curr_mode, cx.local.alarm_dur);
-                    buzzer::spawn(BuzzerEvent::Alarm {
-                        i: Some(*cx.local.curr_al),
-                    })
-                    .unwrap();
-                    *state = MainState::AlarmSetting;
-                }
-                MainEvent::ShortButtonPress => {
-                    *cx.local.alarm_enabled ^= true;
-                    if *cx.local.alarm_enabled {
-                        buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
+                    Two => {
+                        *cx.local.alarm_enabled ^= true;
+                        if *cx.local.alarm_enabled {
+                            buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
+                        }
+                        let mut eeprom = cx.shared.eeprom;
+                        eeprom.lock(|eeprom| {
+                            eeprom.write(1, *cx.local.alarm_enabled as u16).unwrap();
+                        });
                     }
-                    let mut eeprom = cx.shared.eeprom;
-                    eeprom.lock(|eeprom| {
-                        eeprom.write(1, *cx.local.alarm_enabled as u16).unwrap();
-                    });
-                }
+                    Four => {
+                        *curr_mode = OperatingMode::DAY {
+                            mode: LightMode::GRADIENT,
+                        };
+                        if let Some(dt) = *datetime {
+                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                        }
+                    }
+                    Five => {
+                        *curr_mode = OperatingMode::DAY {
+                            mode: LightMode::FIRE,
+                        };
+                        if let Some(dt) = *datetime {
+                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                        }
+                    }
+                    Six => {
+                        *curr_mode = OperatingMode::DAY {
+                            mode: LightMode::SOLID_COLOR {
+                                color: DEFAULT_LED_COLOR
+                                .iter()
+                                .map(|v| ((v as usize) * (GAMMA8[60] as usize) / 255) as u8)
+                                .collect(),
+                            },
+                        };
+                        if let Some(dt) = *datetime {
+                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                        }
+                    }
+                    _ => {
+                        defmt::error!("Unh");
+                    }
+                },
             },
             MainState::AlarmSetting => match ev {
                 MainEvent::PPSTick { dt: _, gps_lock: _ } => {}
-                MainEvent::LongButtonPress => {
-                    let (h, m, _) = alarm_time.as_hms();
-                    let hm: u16 = ((h as u16) << 8) | (m as u16);
+                MainEvent::Remote { btn } => match btn {
+                    One => {
+                        let (h, m, _) = alarm_time.as_hms();
+                        let hm: u16 = ((h as u16) << 8) | (m as u16);
 
-                    let mut eeprom = cx.shared.eeprom;
-                    eeprom.lock(|eeprom| {
-                        eeprom.write(2, hm).unwrap();
-                    });
-                    *state = MainState::TimeDisplay;
-                }
-                MainEvent::ShortButtonPress => {
-                    *cx.local.curr_al += 1;
-                    if *cx.local.curr_al >= ALARMS.len() {
-                        *cx.local.curr_al = 0;
+                        let mut eeprom = cx.shared.eeprom;
+                        eeprom.lock(|eeprom| {
+                            eeprom.write(2, hm).unwrap();
+                        });
+                        buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
+                        *state = MainState::TimeDisplay;
                     }
-                    buzzer::spawn(BuzzerEvent::Alarm {
-                        i: Some(*cx.local.curr_al),
-                    })
-                    .unwrap();
-                }
+                    Next => {
+                        *cx.local.curr_al += 1;
+                        if *cx.local.curr_al >= ALARMS.len() {
+                            *cx.local.curr_al = 0;
+                        }
+                        buzzer::spawn(BuzzerEvent::Alarm {
+                            i: Some(*cx.local.curr_al),
+                        })
+                        .unwrap();
+                    }
+                    Prev => {
+                        if *cx.local.curr_al == 0 {
+                            *cx.local.curr_al = ALARMS.len() - 1;
+                        } else {
+                            *cx.local.curr_al -= 1;
+                        }
+                        buzzer::spawn(BuzzerEvent::Alarm {
+                            i: Some(*cx.local.curr_al),
+                        })
+                        .unwrap();
+                    }
+                    ChannelListPrev => {
+                        *alarm_time -= Duration::minutes(5);
+                        disp_time(*alarm_time, curr_mode, cx.local.alarm_dur);
+                    }
+                    ChannelListNext => {
+                        *alarm_time += Duration::minutes(5);
+                        disp_time(*alarm_time, curr_mode, cx.local.alarm_dur);
+                    }
+                    _ => {
+                        defmt::error!("Unh");
+                    }
+                },
                 _ => (),
             },
         }
