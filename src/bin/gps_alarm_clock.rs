@@ -212,39 +212,61 @@ mod app {
 
     pub struct FireSim<const X: usize, const Y: usize> {
         pixels: [[u8; X]; Y],
+        prev_pixels: [[u8; X]; Y],
         rng: Rand32,
         slf: usize,
         c: usize,
     }
 
     impl<const X: usize, const Y: usize> FireSim<X, Y> {
-        const FIRE_PALETTE: [RGB8; 20] = [
-            RGB8::new(5, 0, 0),
-            RGB8::new(30, 0, 0),
+        const FIRE_PALETTE: [RGB8; 40] = [
+            RGB8::new(11, 0, 0),
+            RGB8::new(24, 0, 0),
+            RGB8::new(37, 0, 0),
+            RGB8::new(50, 0, 0),
+            RGB8::new(66, 0, 0),
             RGB8::new(79, 0, 0),
-            RGB8::new(116, 0, 0),
-            RGB8::new(150, 0, 0),
-            RGB8::new(186, 0, 0),
-            RGB8::new(221, 0, 0),
+            RGB8::new(92, 0, 0),
+            RGB8::new(105, 0, 0),
+            RGB8::new(121, 0, 0),
+            RGB8::new(134, 0, 0),
+            RGB8::new(147, 0, 0),
+            RGB8::new(160, 0, 0),
+            RGB8::new(176, 0, 0),
+            RGB8::new(189, 0, 0),
+            RGB8::new(202, 0, 0),
+            RGB8::new(215, 0, 0),
+            RGB8::new(231, 0, 0),
+            RGB8::new(244, 0, 0),
             RGB8::new(255, 2, 0),
-            RGB8::new(255, 37, 0),
-            RGB8::new(255, 73, 0),
-            RGB8::new(255, 107, 0),
-            RGB8::new(255, 144, 0),
-            RGB8::new(255, 178, 0),
-            RGB8::new(255, 215, 0),
-            RGB8::new(255, 249, 0),
-            RGB8::new(255, 255, 46),
-            RGB8::new(255, 255, 97),
-            RGB8::new(255, 255, 153),
-            RGB8::new(255, 255, 204),
-            RGB8::new(255, 255, 255),
+            RGB8::new(255, 16, 0),
+            RGB8::new(255, 31, 0),
+            RGB8::new(255, 44, 0),
+            RGB8::new(255, 58, 0),
+            RGB8::new(255, 71, 0),
+            RGB8::new(255, 86, 0),
+            RGB8::new(255, 100, 0),
+            RGB8::new(255, 113, 0),
+            RGB8::new(255, 126, 0),
+            RGB8::new(255, 142, 0),
+            RGB8::new(255, 155, 0),
+            RGB8::new(255, 168, 0),
+            RGB8::new(255, 181, 0),
+            RGB8::new(255, 197, 0),
+            RGB8::new(255, 210, 0),
+            RGB8::new(255, 223, 0),
+            RGB8::new(255, 236, 0),
+            RGB8::new(255, 252, 0),
+            RGB8::new(255, 255, 15),
+            RGB8::new(255, 255, 34),
+            RGB8::new(255, 255, 54),
         ];
 
         #[inline]
         fn new(seed: u64, slf: usize) -> Self {
             Self {
                 pixels: [[0; X]; Y],
+                prev_pixels: [[0; X]; Y],
                 rng: Rand32::new(seed),
                 slf,
                 c: 0,
@@ -254,24 +276,25 @@ mod app {
         fn update(&mut self) {
             if self.c == self.slf {
                 self.c = 0;
+                self.prev_pixels = self.pixels;
                 for i in (1..Y - 1).rev() {
                     for j in 1..X - 1 {
                         let mut n = 0;
 
-                        let decay = self.rng.rand_range(2..4) as u8;
+                        let decay = self.rng.rand_range(4..6) as u8;
                         if self.pixels[i - 1][j] > decay {
                             n = self.pixels[i - 1][j] - decay;
                         }
-                        if self.rng.rand_range(0..100) == 0 {
-                            n += 8;
+                        if self.rng.rand_range(0..200) == 0 {
+                            n += 4;
                         }
                         self.pixels[i][j] = n;
                     }
                 }
 
                 for j in 1..X - 1 {
-                    let range = ((Fire::FIRE_PALETTE.len() - 15) as u32)
-                        ..((Fire::FIRE_PALETTE.len() - 2) as u32);
+                    let range = ((Fire::FIRE_PALETTE.len() - 30) as u32)
+                        ..((Fire::FIRE_PALETTE.len() - 1) as u32);
                     self.pixels[0][j] = self.rng.rand_range(range) as u8;
                 }
             } else {
@@ -282,8 +305,15 @@ mod app {
 
     impl<const X: usize, const Y: usize> ColorMap for FireSim<X, Y> {
         fn get(&self, x: usize, y: usize) -> RGB8 {
-            let k = if (self.pixels[Y - y - 2][x + 1] as usize) < Fire::FIRE_PALETTE.len() {
-                self.pixels[Y - y - 2][x + 1]
+            let (y, x) = (Y - y - 2, x + 1);
+            let (p1, p2) = (self.pixels[y][x] as i16, self.prev_pixels[y][x] as i16);
+            let r = (self.c as i16) * (p1 - p2) / ((self.slf as i16));
+            let mut p = self.prev_pixels[y][x] as i16 + r;
+            if p < 0 {
+                p = 0;
+            };
+            let k = if p < (Fire::FIRE_PALETTE.len() as i16) {
+                p as u8
             } else {
                 (Fire::FIRE_PALETTE.len() - 1) as u8
             };
@@ -634,7 +664,7 @@ mod app {
         main_sm::spawn(MainEvent::Timeout).unwrap();
         buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
 
-        let fire = FireSim::new(666, 7);
+        let fire = FireSim::new(666, 14);
         let gradient = Gradient::new();
         let solid = SolidColor::new(DEFAULT_LED_COLOR);
 
