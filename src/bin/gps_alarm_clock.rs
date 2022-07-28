@@ -8,6 +8,7 @@ mod app {
     use bresenham::Bresenham;
     use core::fmt::{Debug, Write};
     use core::iter::Peekable;
+    use core::ops::RangeInclusive;
     use core::slice::Iter;
     use defmt::{write, Debug2Format, Format, Formatter};
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
@@ -311,6 +312,12 @@ mod app {
             }
         }
 
+        fn reset(&mut self) {
+            self.pixels = [[0; X]; Y];
+            self.prev_pixels = [[0; X]; Y];
+            self.c = 0;
+        }
+
         fn update(&mut self) {
             if self.c == self.slf {
                 self.c = 0;
@@ -380,10 +387,11 @@ mod app {
     const BUFF_SIZE: usize = 512;
     const NUM_LEDS: usize = (DIGIT_LEN * 6) + (2 * COLON_LEN);
     const LEDS_BUF_SIZE: usize = 2 * 2048;
-    const LED_FADE_MAX: u8 = 150;
-    const LED_FADE_SLOPE: usize = 5;
+    const LED_FADE_MAX: u8 = 250;
+    const LED_FADE_SLOPE: usize = 10;
     const LED_FADE_SPEED: u32 = 5;
     const UTC_OFFSET: Duration = Duration::HOUR;
+    const NIGHT_RANGE: RangeInclusive<u8> = 7..=21;
     const SUNRISE_LEN: Duration = Duration::minutes(30);
     const ALARM_LEN: Duration = Duration::minutes(3);
     const BUZZER_BASE_FREQ_HZ: u32 = 6000;
@@ -517,7 +525,6 @@ mod app {
     #[allow(non_camel_case_types)]
     pub enum OperatingMode {
         DAY { mode: LightMode },
-        NIGHT,
         SUNRISE { ramp: LinearRamp },
         ALARM,
     }
@@ -694,7 +701,7 @@ mod app {
             &mut afio.mapr,
             BUZZER_BASE_FREQ_HZ.hz(),
         );
-        buzz_pwm.set_duty(Channel::C1, 1 * (buzz_pwm.get_max_duty() / 100));
+        buzz_pwm.set_duty(Channel::C1, 20 * (buzz_pwm.get_max_duty() / 100));
 
         let mut pin = gpiob.pb0.into_floating_input(&mut gpiob.crl);
         pin.make_interrupt_source(&mut afio);
@@ -707,7 +714,7 @@ mod app {
         main_sm::spawn(MainEvent::Timeout).unwrap();
         buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
 
-        let fire = FireSim::new(666, 14);
+        let fire = FireSim::new(666, 15);
         let gradient = Gradient::new();
         let solid = SolidColor::new(DEFAULT_LED_COLOR);
 
@@ -947,6 +954,7 @@ mod app {
             'A' => 0b1011111,
             'b' => 0b1110011,
             'c' => 0b1100001,
+            'C' => 0b1100110,
             'd' => 0b1111001,
             'E' => 0b1100111,
             'F' => 0b1000111,
@@ -958,6 +966,7 @@ mod app {
             'L' => 0b1100010,
             'm' => 0b1010100,
             'n' => 0b1010001,
+            'N' => 0b1011110,
             'o' => 0b1110001,
             'P' => 0b1001111,
             'q' => 0b0011111,
@@ -969,7 +978,7 @@ mod app {
             'X' => 0b1011011,
             'y' => 0b0111011,
             'Z' => 0b1101101,
-            _ => 0b0010111,
+            '?' | _ => 0b0010111,
         }
     }
 
@@ -1109,8 +1118,12 @@ mod app {
                 }
 
                 let cmap: &dyn ColorMap = match *cx.local.mode {
-                    LightMode::GRADIENT => cx.local.gradient,
+                    LightMode::GRADIENT => {
+                        fire.reset();
+                        cx.local.gradient
+                    }
                     LightMode::SOLID_COLOR { color } => {
+                        fire.reset();
                         *cx.local.solid = SolidColor::new(color);
                         cx.local.solid
                     }
@@ -1720,8 +1733,8 @@ mod app {
     ) {
         if let Some(dt) = dt {
             let s = dt.time().second();
-            match *mode {
-                OperatingMode::DAY { .. } => match dt.time().minute() {
+            if NIGHT_RANGE.contains(&dt.time().hour()) {
+                match dt.time().minute() {
                     0 => {
                         if s == 0 {
                             buzzer::spawn(BuzzerEvent::HourChime).unwrap();
@@ -1738,18 +1751,14 @@ mod app {
                         }
                     }
                     _ => (),
-                },
-                _ => {}
+                }
             }
 
-            match *mode {
-                OperatingMode::ALARM => {
-                    *alarm_dur += Duration::SECOND;
-                    if *alarm_dur == ALARM_LEN {
-                        buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
-                    }
+            if *mode == OperatingMode::ALARM {
+                *alarm_dur += Duration::SECOND;
+                if *alarm_dur == ALARM_LEN {
+                    buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
                 }
-                _ => {}
             }
         }
     }
@@ -1766,19 +1775,10 @@ mod app {
 
         let lmode = match mode {
             OperatingMode::DAY { mode } => mode.clone(),
-            OperatingMode::NIGHT => LightMode::SOLID_COLOR {
-                color: DEFAULT_LED_COLOR
-                    .iter()
-                    .map(|v| ((v as usize) * (GAMMA8[60] as usize) / 255) as u8)
-                    .collect(),
-            },
             OperatingMode::SUNRISE { ramp } => {
                 if let Some(y) = ramp.next() {
-                    let rgb = SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()].to_be_bytes()
-                        [1..4]
-                        .iter()
-                        .map(|v| GAMMA8[*v as usize])
-                        .collect::<Vec<_, 3>>();
+                    let rgb =
+                        &SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()].to_be_bytes()[1..4];
                     LightMode::SOLID_COLOR {
                         color: RGB8::new(rgb[0], rgb[1], rgb[2]) / 4,
                     }
@@ -1827,7 +1827,7 @@ mod app {
                 MainEvent::Timeout => {
                     if *s {
                         light::spawn(LightEvent::DIGITS {
-                            dg: Some(str_to_array("noSync")),
+                            dg: Some(str_to_array("noSyNC")),
                             col1: false,
                             col2: false,
                             mode: LightMode::GRADIENT,
@@ -1857,94 +1857,108 @@ mod app {
                 }
                 _ => (),
             },
-            MainState::TimeDisplay => match ev {
-                MainEvent::PPSTick { dt, gps_lock: _ } => {
-                    pps_tick_handler(dt, curr_mode, cx.local.alarm_dur);
-                    *datetime = dt;
-                    if let Some(dt) = *datetime {
-                        if *cx.local.alarm_enabled
-                            && ![Weekday::Saturday, Weekday::Sunday].contains(&dt.date().weekday())
-                            && dt.time() == (*alarm_time - SUNRISE_LEN)
-                        {
-                            defmt::info!("Starting sunrise");
-                            *curr_mode = OperatingMode::SUNRISE {
-                                ramp: LinearRamp::new(
-                                    SUNRISE_LEN.whole_seconds().try_into().unwrap(),
-                                    SUNRISE_CMAP.len(),
-                                ),
-                            };
-                        }
+            MainState::TimeDisplay => {
+                match ev {
+                    MainEvent::PPSTick { dt, gps_lock: _ } => {
+                        pps_tick_handler(dt, curr_mode, cx.local.alarm_dur);
+                        *datetime = dt;
+                        if let Some(dt) = *datetime {
+                            if *cx.local.alarm_enabled
+                                && ![Weekday::Saturday, Weekday::Sunday]
+                                    .contains(&dt.date().weekday())
+                                && dt.time() == (*alarm_time - SUNRISE_LEN)
+                            {
+                                defmt::info!("Starting sunrise");
+                                *curr_mode = OperatingMode::SUNRISE {
+                                    ramp: LinearRamp::new(
+                                        SUNRISE_LEN.whole_seconds().try_into().unwrap(),
+                                        SUNRISE_CMAP.len(),
+                                    ),
+                                };
+                            }
 
-                        disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
-                        *cx.local.handle =
-                            main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
-                    }
-                }
-                MainEvent::Timeout => {
-                    light::spawn(LightEvent::DIGITS {
-                        dg: None,
-                        col1: false,
-                        col2: false,
-                        mode: LightMode::GRADIENT,
-                    })
-                    .unwrap();
-                }
-                MainEvent::Remote { btn } => match btn {
-                    One => {
-                        if let Some(handle) = cx.local.handle.take() {
-                            handle.cancel().ok();
+                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                            *cx.local.handle =
+                                main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
                         }
-                        disp_time(*alarm_time, curr_mode, cx.local.alarm_dur);
-                        buzzer::spawn(BuzzerEvent::Alarm {
-                            i: Some(*cx.local.curr_al),
+                    }
+                    MainEvent::Timeout => {
+                        light::spawn(LightEvent::DIGITS {
+                            dg: None,
+                            col1: false,
+                            col2: false,
+                            mode: LightMode::GRADIENT,
                         })
                         .unwrap();
-                        *state = MainState::AlarmSetting;
                     }
-                    Two => {
-                        *cx.local.alarm_enabled ^= true;
-                        if *cx.local.alarm_enabled {
-                            buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
+                    MainEvent::Remote { btn } => match btn {
+                        One => {
+                            if let Some(handle) = cx.local.handle.take() {
+                                handle.cancel().ok();
+                            }
+                            disp_time(*alarm_time, curr_mode, cx.local.alarm_dur);
+                            buzzer::spawn(BuzzerEvent::Alarm {
+                                i: Some(*cx.local.curr_al),
+                            })
+                            .unwrap();
+                            *state = MainState::AlarmSetting;
                         }
-                        let mut eeprom = cx.shared.eeprom;
-                        eeprom.lock(|eeprom| {
-                            eeprom.write(1, *cx.local.alarm_enabled as u16).unwrap();
-                        });
-                    }
-                    Four => {
-                        *curr_mode = OperatingMode::DAY {
-                            mode: LightMode::GRADIENT,
-                        };
-                        if let Some(dt) = *datetime {
-                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                        Two => {
+                            *cx.local.alarm_enabled ^= true;
+                            if *cx.local.alarm_enabled {
+                                buzzer::spawn(BuzzerEvent::HourChime).unwrap();
+                            } else {
+                                buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
+                            }
+                            let mut eeprom = cx.shared.eeprom;
+                            eeprom.lock(|eeprom| {
+                                eeprom.write(1, *cx.local.alarm_enabled as u16).unwrap();
+                            });
                         }
-                    }
-                    Five => {
-                        *curr_mode = OperatingMode::DAY {
-                            mode: LightMode::FIRE,
-                        };
-                        if let Some(dt) = *datetime {
-                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                        Four => {
+                            *curr_mode = OperatingMode::DAY {
+                                mode: LightMode::GRADIENT,
+                            };
+                            if let Some(dt) = *datetime {
+                                disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                            }
                         }
-                    }
-                    Six => {
-                        *curr_mode = OperatingMode::DAY {
-                            mode: LightMode::SOLID_COLOR {
-                                color: DEFAULT_LED_COLOR
-                                .iter()
-                                .map(|v| ((v as usize) * (GAMMA8[60] as usize) / 255) as u8)
-                                .collect(),
-                            },
-                        };
-                        if let Some(dt) = *datetime {
-                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                        Five => {
+                            *curr_mode = OperatingMode::DAY {
+                                mode: LightMode::FIRE,
+                            };
+                            if let Some(dt) = *datetime {
+                                disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                            }
                         }
-                    }
-                    _ => {
-                        defmt::error!("Unh");
-                    }
-                },
-            },
+                        Six => {
+                            *curr_mode = OperatingMode::DAY {
+                                mode: LightMode::SOLID_COLOR {
+                                    color: DEFAULT_LED_COLOR
+                                        .iter()
+                                        .map(|v| ((v as usize) * (GAMMA8[60] as usize) / 255) as u8)
+                                        .collect(),
+                                },
+                            };
+                            if let Some(dt) = *datetime {
+                                disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                            }
+                        }
+                        _ => {
+                            defmt::error!("Unh");
+                        }
+                    },
+                }
+                if (matches!(*curr_mode, OperatingMode::SUNRISE { .. })
+                    || matches!(*curr_mode, OperatingMode::ALARM))
+                    && matches!(ev, MainEvent::Remote { .. })
+                {
+                    *curr_mode = OperatingMode::DAY {
+                        mode: LightMode::GRADIENT,
+                    };
+                    buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
+                }
+            }
             MainState::AlarmSetting => match ev {
                 MainEvent::PPSTick { dt: _, gps_lock: _ } => {}
                 MainEvent::Remote { btn } => match btn {
@@ -1958,6 +1972,9 @@ mod app {
                         });
                         buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
                         *state = MainState::TimeDisplay;
+                        if let Some(dt) = *datetime {
+                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                        }
                     }
                     Next => {
                         *cx.local.curr_al += 1;
