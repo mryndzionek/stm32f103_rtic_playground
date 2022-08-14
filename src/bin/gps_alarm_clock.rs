@@ -36,12 +36,13 @@ mod app {
     use stm32f1xx_hal::{
         dma::{Transfer, TxDma},
         flash::{FlashSize, Parts, SectorSize},
+        pac::TIM1,
         pac::TIM3,
         prelude::*,
         pwm::{Channel, Pwm, C1},
         serial::{Config, Rx2, Serial},
         spi::{Mode, NoMiso, NoSck, Phase, Polarity, Spi, Spi2NoRemap},
-        timer::{Tim3NoRemap, Timer},
+        timer::{Tim1NoRemap, Tim3NoRemap, Timer},
     };
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
@@ -579,6 +580,12 @@ mod app {
         fire: Fire,
         gradient: Gradient,
         solid: SolidColor,
+        led_pwm: Pwm<
+            TIM1,
+            Tim1NoRemap,
+            stm32f1xx_hal::pwm::C1,
+            stm32f1xx_hal::gpio::gpioa::PA8<Alternate<PushPull>>,
+        >,
     }
 
     #[init(local = [flash: Option<Parts> = None,
@@ -703,6 +710,15 @@ mod app {
         );
         buzz_pwm.set_duty(Channel::C1, 20 * (buzz_pwm.get_max_duty() / 100));
 
+        let led_pin = gpioa.pa8.into_alternate_push_pull(&mut gpioa.crh);
+        let mut led_pwm = Timer::tim1(c.device.TIM1, &clocks).pwm::<Tim1NoRemap, _, _, _>(
+            led_pin,
+            &mut afio.mapr,
+            30.hz(),
+        );
+        led_pwm.set_duty(Channel::C1, 0);
+        led_pwm.enable(Channel::C1);
+
         let mut pin = gpiob.pb0.into_floating_input(&mut gpiob.crl);
         pin.make_interrupt_source(&mut afio);
         pin.enable_interrupt(&c.device.EXTI);
@@ -717,6 +733,8 @@ mod app {
         let fire = FireSim::new(666, 15);
         let gradient = Gradient::new();
         let solid = SolidColor::new(DEFAULT_LED_COLOR);
+
+        led_pwm::spawn().unwrap();
 
         (
             Shared {
@@ -743,6 +761,7 @@ mod app {
                 fire,
                 gradient,
                 solid,
+                led_pwm,
             },
             init::Monotonics(mono),
         )
@@ -800,6 +819,28 @@ mod app {
         } else {
             Duration::ZERO
         }
+    }
+
+    #[task(local = [led_pwm, i: usize = 0, dir: bool = false], priority = 16, capacity = 1)]
+    fn led_pwm(cx: led_pwm::Context) {
+        if *cx.local.dir {
+            *cx.local.i -= 1;
+            if *cx.local.i == 28 {
+                *cx.local.dir = false;
+            }
+        } else {
+            *cx.local.i += 1;
+            if *cx.local.i == 255 {
+                *cx.local.dir = true;
+            }
+        }
+
+        let s = (GAMMA8[*cx.local.i] as u32) * (cx.local.led_pwm.get_max_duty() as u32) / 255;
+        defmt::error!("{}", s);
+        cx.local
+            .led_pwm
+            .set_duty(Channel::C1, s.try_into().unwrap());
+        led_pwm::spawn_after(10.millis()).unwrap();
     }
 
     #[task(shared = [datetime, pps_timeout, gps_locked], local = [cons, parser], priority = 2, capacity = 1)]
