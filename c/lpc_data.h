@@ -5,7 +5,7 @@
 
 #include "fix.h"
 
-#define LPC_ORDER (6)
+#define LPC_ORDER (8)
 #define LPC_FRAME_LEN (440)
 #define LPC_SAMPLE_RATE (11000)
 #define LPC_DEEMPHASIS_FACTOR (0xF8CAC)
@@ -73,6 +73,6 @@ typedef enum {
     LPC_MAX_SEQ
 } lpc_seq_e;
 
-lpc_seq_t * lpc_get_seq(lpc_seq_e id);
+const lpc_seq_t * const lpc_get_seq(lpc_seq_e id);
 
 #endif
