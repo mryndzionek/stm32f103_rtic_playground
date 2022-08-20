@@ -39,6 +39,11 @@ bresenham = "0.1"
 oorandom = "11.1"
 rgb = "0.8"
 
+cty = "0.2"
+
+[build-dependencies]
+cc = "1.0"
+
 # cargo build/run
 [profile.dev]
 codegen-units = 1

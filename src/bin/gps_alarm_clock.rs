@@ -47,6 +47,8 @@ mod app {
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
 
+    use stm32f103_rtic_playground::*;
+
     #[derive(Debug, Default)]
     pub struct Mp3Remote;
 
@@ -586,6 +588,8 @@ mod app {
             stm32f1xx_hal::pwm::C1,
             stm32f1xx_hal::gpio::gpioa::PA8<Alternate<PushPull>>,
         >,
+        decoder: &'static mut lpc_seq_decoder_t,
+        voice_rng: Rand32,
     }
 
     #[init(local = [flash: Option<Parts> = None,
@@ -736,6 +740,9 @@ mod app {
 
         led_pwm::spawn().unwrap();
 
+        let decoder = unsafe { lpc_seq_decoder_new() };
+        let voice_rng = Rand32::new(664);
+
         (
             Shared {
                 datetime: None,
@@ -762,6 +769,8 @@ mod app {
                 gradient,
                 solid,
                 led_pwm,
+                decoder: unsafe { &mut *decoder },
+                voice_rng,
             },
             init::Monotonics(mono),
         )
@@ -836,7 +845,6 @@ mod app {
         }
 
         let s = (GAMMA8[*cx.local.i] as u32) * (cx.local.led_pwm.get_max_duty() as u32) / 255;
-        defmt::error!("{}", s);
         cx.local
             .led_pwm
             .set_duty(Channel::C1, s.try_into().unwrap());
@@ -1233,6 +1241,7 @@ mod app {
             alarm: Iter<'static, (u16, u16)>,
             iter: Iter<'static, (u16, u16)>,
         },
+        Say,
     }
 
     #[derive(Debug, PartialEq, Format)]
@@ -1242,6 +1251,7 @@ mod app {
         SecondTick,
         Next,
         Alarm { i: Option<usize> },
+        Say { h: u8, m: u8 },
     }
 
     const ALARMS: &[&[(u16, u16)]] = &[
@@ -1543,20 +1553,55 @@ mod app {
         ],
     ];
 
-    #[task(local = [buzz_pwm,
+    fn get_seq_from_time(h: u8, m: u8) -> Option<Vec<*const lpc_seq_t, 5>> {
+        let mut v: Vec<*const lpc_seq_t, 5> = Vec::new();
+        unsafe {
+            v.push(lpc_get_seq(lpc_seq_e_LPC_JEST_GODZINA)).ok()?;
+            v.push(lpc_get_seq(if h < 21 { h.into() } else { 20 }))
+                .ok()?;
+            if h > 20 {
+                v.push(lpc_get_seq((h - 20).into())).ok()?;
+            }
+            if m < 21 {
+                if m == 0 {
+                    v.push(lpc_get_seq(lpc_seq_e_LPC_ZERO)).ok()?;
+                }
+                v.push(lpc_get_seq((lpc_seq_e_LPC_ZERO + (m as u32)).into()))
+                    .ok()?;
+            } else {
+                v.push(lpc_get_seq(
+                    (lpc_seq_e_LPC_OSIEMNASCIE + ((m / 10) as u32)).into(),
+                ))
+                .ok()?;
+                if (m % 10) > 0 {
+                    v.push(lpc_get_seq((lpc_seq_e_LPC_ZERO + ((m % 10) as u32)).into()))
+                        .ok()?;
+                }
+            }
+        }
+        Some(v)
+    }
+
+    #[task(local = [buzz_pwm, decoder, voice_rng,
+                    y_min: fix16_t = 0,
+                    y_max: fix16_t = 0,
                     state: BuzzerState = BuzzerState::Chime {is_on: false, chime: None},
                     handle: Option<buzzer::SpawnHandle> = None],
            shared = [],
-           priority = 4,
+           priority = 16,
            capacity = 2)]
     fn buzzer(cx: buzzer::Context, ev: BuzzerEvent) {
         const HOUR_CHIME: [u32; 3] = [100, 80, 50];
         const QUARTER_CHIME: [u32; 1] = [50];
         const SECOND_TICK: [u32; 1] = [1];
 
+        let next_run = monotonics::now() + 90.micros();
+
         let buzzer = cx.local.buzz_pwm;
         let s = cx.local.state;
         let handle = cx.local.handle;
+        let decoder = *cx.local.decoder as *mut lpc_seq_decoder_t;
+        let rng = cx.local.voice_rng;
 
         match s {
             BuzzerState::Chime { is_on, chime } => match ev {
@@ -1571,6 +1616,27 @@ mod app {
                             alarm: ALARMS[i].iter(),
                             iter: ALARMS[i].iter(),
                         };
+                        buzzer.set_period(BUZZER_BASE_FREQ_HZ.hz());
+                        buzzer.enable(Channel::C1);
+                        buzzer::spawn(BuzzerEvent::Next).unwrap();
+                    }
+                }
+                BuzzerEvent::Say { h, m } => {
+                    if let Some(seq) = get_seq_from_time(h, m) {
+                        unsafe {
+                            lpc_seq_decoder_update(
+                                decoder,
+                                seq.as_slice().as_ptr(),
+                                seq.len() as u32,
+                            );
+                        }
+
+                        *s = BuzzerState::Say;
+                        buzzer.set_period(32000.hz());
+                        buzzer.enable(Channel::C1);
+                        if let Some(handle) = handle.take() {
+                            handle.cancel().ok();
+                        }
                         buzzer::spawn(BuzzerEvent::Next).unwrap();
                     }
                 }
@@ -1580,7 +1646,7 @@ mod app {
                         BuzzerEvent::QuarterChime => *chime = Some(QUARTER_CHIME.iter()),
                         BuzzerEvent::SecondTick => *chime = Some(SECOND_TICK.iter()),
                         BuzzerEvent::Next => (),
-                        BuzzerEvent::Alarm { .. } => {
+                        BuzzerEvent::Alarm { .. } | BuzzerEvent::Say { .. } => {
                             defmt::panic!();
                         }
                     }
@@ -1669,6 +1735,31 @@ mod app {
                             is_on: false,
                             chime: None,
                         };
+                    }
+                }
+                _ => {}
+            },
+            BuzzerState::Say => match ev {
+                BuzzerEvent::Next => {
+                    let mut y = 0;
+                    let finished = unsafe {
+                        lpc_seq_decoder_exec(decoder, rng.rand_u32(), &mut y as *mut fix16_t)
+                    };
+                    if finished {
+                        defmt::error!(
+                            "{} - {} {}",
+                            *cx.local.y_min,
+                            *cx.local.y_max,
+                            buzzer.get_max_duty()
+                        );
+                        buzzer.disable(Channel::C1);
+                        *s = BuzzerState::Chime {
+                            is_on: false,
+                            chime: None,
+                        };
+                    } else {
+                        buzzer.set_duty(Channel::C1, ((y + 5000000) / 2500) as u16);
+                        *handle = buzzer::spawn_at(next_run, BuzzerEvent::Next).ok();
                     }
                 }
                 _ => {}
@@ -1983,6 +2074,12 @@ mod app {
                             };
                             if let Some(dt) = *datetime {
                                 disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                            }
+                        }
+                        Nine => {
+                            if let Some(dt) = *datetime {
+                                let (h, m, _) = dt.as_hms();
+                                buzzer::spawn(BuzzerEvent::Say { h: h, m: m }).unwrap();
                             }
                         }
                         _ => {

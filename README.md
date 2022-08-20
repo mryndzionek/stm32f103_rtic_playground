@@ -35,5 +35,11 @@ $PQ1PPS,W,4,100*1D
 $PQBAUD,W,38400*7B
 ```
 
+## Compiling bindings
+
+```
+bindgen --ctypes-prefix=cty --use-core c/bindings.h > src/lpc.rs
+```
+
 
 

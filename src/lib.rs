@@ -1,5 +1,8 @@
 #![no_std]
 
+#![allow(non_camel_case_types)]
+#![allow(non_upper_case_globals)]
+
 use defmt_rtt as _; // global logger
 use stm32f1xx_hal as _; // memory layout
 
@@ -27,3 +30,5 @@ pub fn exit() -> ! {
         cortex_m::asm::bkpt();
     }
 }
+
+include!("lpc.rs");

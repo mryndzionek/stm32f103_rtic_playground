@@ -12,6 +12,7 @@ use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+extern crate cc;
 
 fn main() {
     // Put `memory.x` in our output directory and ensure it's
@@ -28,4 +29,10 @@ fn main() {
     // here, we ensure the build script is only re-run when
     // `memory.x` is changed.
     println!("cargo:rerun-if-changed=memory.x");
+
+    cc::Build::new()
+        .define("NDEBUG", None)
+        .file("c/lpc.c")
+        .file("c/lpc_data.c")
+        .compile("liblpc.a");
 }
