@@ -718,7 +718,7 @@ mod app {
         let mut led_pwm = Timer::tim1(c.device.TIM1, &clocks).pwm::<Tim1NoRemap, _, _, _>(
             led_pin,
             &mut afio.mapr,
-            30.hz(),
+            250.hz(),
         );
         led_pwm.set_duty(Channel::C1, 0);
         led_pwm.enable(Channel::C1);
@@ -839,7 +839,7 @@ mod app {
             }
         } else {
             *cx.local.i += 1;
-            if *cx.local.i == 255 {
+            if *cx.local.i == 128 {
                 *cx.local.dir = true;
             }
         }
@@ -848,7 +848,7 @@ mod app {
         cx.local
             .led_pwm
             .set_duty(Channel::C1, s.try_into().unwrap());
-        led_pwm::spawn_after(10.millis()).unwrap();
+        led_pwm::spawn_after(50.millis()).unwrap();
     }
 
     #[task(shared = [datetime, pps_timeout, gps_locked], local = [cons, parser], priority = 2, capacity = 1)]
@@ -905,13 +905,14 @@ mod app {
                         let time = Time::from_hms(hours, minutes, seconds as u8).unwrap();
                         let date_time = PrimitiveDateTime::new(date, time);
                         datetime.lock(|dt| match *dt {
-                            Some(dt) => {
-                                if date_time != dt {
+                            Some(_dt) => {
+                                if date_time != _dt {
                                     defmt::warn!(
                                         "Unexpected date_time: {} != {}",
                                         Debug2Format(&date_time),
-                                        Debug2Format(&dt)
+                                        Debug2Format(&_dt)
                                     );
+                                    *dt = Some(date_time);
                                 }
                             }
                             None => {
