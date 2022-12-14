@@ -398,6 +398,9 @@ mod app {
     const ALARM_LEN: Duration = Duration::minutes(3);
     const BUZZER_BASE_FREQ_HZ: u32 = 6000;
     const DEFAULT_LED_COLOR: RGB8 = RGB8::new(255, 0, 0);
+    const DEFAULT_DAY_MODE: LightMode = LightMode::SOLID_COLOR {
+        color: RGB8::new(255, 0, 0),
+    };
 
     const EEPROM_PARAMS: Params = Params {
         first_page: 126,
@@ -572,7 +575,8 @@ mod app {
         prod: bbqueue::Producer<'static, BUFF_SIZE>,
         cons: bbqueue::Consumer<'static, BUFF_SIZE>,
         dst: Duration,
-        buzz_pwm: PwmHz<TIM3, Tim3NoRemap, Ch<0>, stm32f1xx_hal::gpio::gpioa::PA6<Alternate<PushPull>>>,
+        buzz_pwm:
+            PwmHz<TIM3, Tim3NoRemap, Ch<0>, stm32f1xx_hal::gpio::gpioa::PA6<Alternate<PushPull>>>,
         wdg: IndependentWatchdog,
         alarm_enabled: bool,
         alarm_time: Time,
@@ -1101,7 +1105,7 @@ mod app {
                     fire,
                     gradient,
                     solid,
-                    mode: LightMode = LightMode::GRADIENT,
+                    mode: LightMode = DEFAULT_DAY_MODE,
                     xfer: Option<Xfer> = None,
                     prev_dg: [char; NUM_DIGITS] = [' '; NUM_DIGITS],
                     trans_state: [[LightTransition; NUM_SEGS]; NUM_DIGITS] = [[LightTransition::Finished {state: false}; NUM_SEGS]; NUM_DIGITS],
@@ -1937,7 +1941,7 @@ mod app {
                                  curr_al: usize = 0,
                                  state: MainState = MainState::NoSync {s: true},
                                  handle: Option<main_sm::SpawnHandle> = None,
-                                 mode: OperatingMode = OperatingMode::DAY {mode: LightMode::GRADIENT},
+                                 mode: OperatingMode = OperatingMode::DAY {mode: DEFAULT_DAY_MODE},
                                  alarm_enabled,
                                  alarm_time,
                                  alarm_dur: Duration = Duration::ZERO,
@@ -1958,7 +1962,7 @@ mod app {
                             dg: Some(str_to_array("noSyNC")),
                             col1: false,
                             col2: false,
-                            mode: LightMode::GRADIENT,
+                            mode: DEFAULT_DAY_MODE,
                         })
                         .unwrap();
                         *state = MainState::NoSync { s: false };
@@ -1967,7 +1971,7 @@ mod app {
                             dg: Some([' '; NUM_DIGITS]),
                             col1: false,
                             col2: false,
-                            mode: LightMode::GRADIENT,
+                            mode: DEFAULT_DAY_MODE,
                         })
                         .unwrap();
                         *state = MainState::NoSync { s: true };
@@ -2015,7 +2019,7 @@ mod app {
                             dg: None,
                             col1: false,
                             col2: false,
-                            mode: LightMode::GRADIENT,
+                            mode: DEFAULT_DAY_MODE,
                         })
                         .unwrap();
                     }
@@ -2045,7 +2049,7 @@ mod app {
                         }
                         Four => {
                             *curr_mode = OperatingMode::DAY {
-                                mode: LightMode::GRADIENT,
+                                mode: DEFAULT_DAY_MODE,
                             };
                             if let Some(dt) = *datetime {
                                 disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
@@ -2088,7 +2092,7 @@ mod app {
                     && matches!(ev, MainEvent::Remote { .. })
                 {
                     *curr_mode = OperatingMode::DAY {
-                        mode: LightMode::GRADIENT,
+                        mode: DEFAULT_DAY_MODE,
                     };
                     buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
                 }
