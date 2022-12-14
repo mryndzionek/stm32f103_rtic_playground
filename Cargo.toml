@@ -5,15 +5,12 @@ readme = "README.md"
 name = "stm32f103_rtic_playground"
 version = "0.1.0"
 
-[patch.crates-io]
-stm32f1xx-hal = { git = "https://github.com/stm32-rs/stm32f1xx-hal.git", version = "0.8.0", rev = "cd800ce" }
-
 [dependencies]
-cortex-m = "0.7"
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 defmt = "0.3"
-defmt-rtt = "0.3"
+defmt-rtt = "0.4"
 panic-probe = { version = "0.3.0", features = ["print-defmt"] }
-stm32f1xx-hal = { version = "0.8.0", features = ["stm32f103", "rt"] }
+stm32f1xx-hal = { version = "0.9.0", features = ["stm32f103", "rt"] }
 dwt-systick-monotonic = "1.0.0"
 rtic-monotonic = "1.0.0"
 embedded-hal = { features = ["unproven"], version = "0.2.6" }
@@ -30,7 +27,7 @@ ssd1306 = "0.7"
 infrared = "0.14"
 
 smart-leds = "0.3.0"
-eeprom = { version = "0.2.0" , features = ["stm32f103"] }
+eeprom = { version = "0.3.1" , features = ["stm32f103"] }
 
 bbqueue = "0.5.1"
 nmea0183 = "0.3.0"

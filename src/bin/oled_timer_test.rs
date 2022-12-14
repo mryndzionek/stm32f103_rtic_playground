@@ -80,8 +80,8 @@ mod app {
 
         let clocks = rcc
             .cfgr
-            .use_hse(8.mhz())
-            .sysclk(FREQ.hz())
+            .use_hse(8.MHz())
+            .sysclk(FREQ.Hz())
             .freeze(&mut flash.acr);
 
         // Set up I2C.
@@ -94,7 +94,7 @@ mod app {
             (scl, sda),
             &mut afio.mapr,
             Mode::Fast {
-                frequency: 400_000.hz(),
+                frequency: 400_000.Hz(),
                 duty_cycle: DutyCycle::Ratio2to1,
             },
             clocks,
@@ -118,7 +118,7 @@ mod app {
         let mut dcb = c.core.DCB;
         let dwt = c.core.DWT;
         let systick = c.core.SYST;
-        let mono = DwtSystick::new(&mut dcb, dwt, systick, clocks.sysclk().0);
+        let mono = DwtSystick::new(&mut dcb, dwt, systick, clocks.sysclk().raw());
 
         display::spawn().unwrap();
         update::spawn_after(1.secs()).unwrap();

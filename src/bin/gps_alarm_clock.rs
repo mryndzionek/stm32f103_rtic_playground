@@ -39,10 +39,9 @@ mod app {
         pac::TIM1,
         pac::TIM3,
         prelude::*,
-        pwm::{Channel, Pwm, C1},
         serial::{Config, Rx2, Serial},
         spi::{Mode, NoMiso, NoSck, Phase, Polarity, Spi, Spi2NoRemap},
-        timer::{Tim1NoRemap, Tim3NoRemap, Timer},
+        timer::{Ch, Channel, PwmHz, Tim1NoRemap, Tim3NoRemap, Timer},
     };
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
@@ -573,7 +572,7 @@ mod app {
         prod: bbqueue::Producer<'static, BUFF_SIZE>,
         cons: bbqueue::Consumer<'static, BUFF_SIZE>,
         dst: Duration,
-        buzz_pwm: Pwm<TIM3, Tim3NoRemap, C1, stm32f1xx_hal::gpio::gpioa::PA6<Alternate<PushPull>>>,
+        buzz_pwm: PwmHz<TIM3, Tim3NoRemap, Ch<0>, stm32f1xx_hal::gpio::gpioa::PA6<Alternate<PushPull>>>,
         wdg: IndependentWatchdog,
         alarm_enabled: bool,
         alarm_time: Time,
@@ -582,12 +581,8 @@ mod app {
         fire: Fire,
         gradient: Gradient,
         solid: SolidColor,
-        led_pwm: Pwm<
-            TIM1,
-            Tim1NoRemap,
-            stm32f1xx_hal::pwm::C1,
-            stm32f1xx_hal::gpio::gpioa::PA8<Alternate<PushPull>>,
-        >,
+        led_pwm:
+            PwmHz<TIM1, Tim1NoRemap, Ch<0>, stm32f1xx_hal::gpio::gpioa::PA8<Alternate<PushPull>>>,
         decoder: &'static mut lpc_seq_decoder_t,
         voice_rng: Rand32,
     }
@@ -612,9 +607,9 @@ mod app {
 
         let clocks = rcc
             .cfgr
-            .use_hse(8.mhz())
-            .sysclk(FREQ.hz())
-            .pclk1(36.mhz())
+            .use_hse(8.MHz())
+            .sysclk(FREQ.Hz())
+            .pclk1(36.MHz())
             .freeze(&mut flash.acr);
         let mut afio = c.device.AFIO.constrain();
 
@@ -654,7 +649,7 @@ mod app {
             polarity: Polarity::IdleLow,
             phase: Phase::CaptureOnFirstTransition,
         };
-        let spi = Spi::spi2(c.device.SPI2, pins, mode, 3800.khz(), clocks);
+        let spi = Spi::spi2(c.device.SPI2, pins, mode, 3800.kHz(), clocks);
         let dma = c.device.DMA1.split();
         let ws = spi.with_tx_dma(dma.5);
 
@@ -663,7 +658,7 @@ mod app {
         let mut dcb = c.core.DCB;
         let dwt = c.core.DWT;
         let systick = c.core.SYST;
-        let mono = DwtSystick::new(&mut dcb, dwt, systick, clocks.sysclk().0);
+        let mono = DwtSystick::new(&mut dcb, dwt, systick, clocks.sysclk().raw());
 
         let parser = Parser::new().sentence_only(Sentence::RMC);
         let (prod, cons) = c.local.BB.try_split().unwrap();
@@ -707,18 +702,18 @@ mod app {
         .unwrap();
 
         let buzz_pin = gpioa.pa6.into_alternate_push_pull(&mut gpioa.crl);
-        let mut buzz_pwm = Timer::tim3(c.device.TIM3, &clocks).pwm::<Tim3NoRemap, _, _, _>(
+        let mut buzz_pwm = Timer::new(c.device.TIM3, &clocks).pwm_hz::<Tim3NoRemap, _, _>(
             buzz_pin,
             &mut afio.mapr,
-            BUZZER_BASE_FREQ_HZ.hz(),
+            BUZZER_BASE_FREQ_HZ.Hz(),
         );
         buzz_pwm.set_duty(Channel::C1, 20 * (buzz_pwm.get_max_duty() / 100));
 
         let led_pin = gpioa.pa8.into_alternate_push_pull(&mut gpioa.crh);
-        let mut led_pwm = Timer::tim1(c.device.TIM1, &clocks).pwm::<Tim1NoRemap, _, _, _>(
+        let mut led_pwm = Timer::new(c.device.TIM1, &clocks).pwm_hz::<Tim1NoRemap, _, _>(
             led_pin,
             &mut afio.mapr,
-            30.hz(),
+            250.Hz(),
         );
         led_pwm.set_duty(Channel::C1, 0);
         led_pwm.enable(Channel::C1);
@@ -839,7 +834,7 @@ mod app {
             }
         } else {
             *cx.local.i += 1;
-            if *cx.local.i == 255 {
+            if *cx.local.i == 128 {
                 *cx.local.dir = true;
             }
         }
@@ -848,7 +843,7 @@ mod app {
         cx.local
             .led_pwm
             .set_duty(Channel::C1, s.try_into().unwrap());
-        led_pwm::spawn_after(10.millis()).unwrap();
+        led_pwm::spawn_after(50.millis()).unwrap();
     }
 
     #[task(shared = [datetime, pps_timeout, gps_locked], local = [cons, parser], priority = 2, capacity = 1)]
@@ -905,13 +900,14 @@ mod app {
                         let time = Time::from_hms(hours, minutes, seconds as u8).unwrap();
                         let date_time = PrimitiveDateTime::new(date, time);
                         datetime.lock(|dt| match *dt {
-                            Some(dt) => {
-                                if date_time != dt {
+                            Some(_dt) => {
+                                if date_time != _dt {
                                     defmt::warn!(
                                         "Unexpected date_time: {} != {}",
                                         Debug2Format(&date_time),
-                                        Debug2Format(&dt)
+                                        Debug2Format(&_dt)
                                     );
+                                    *dt = Some(date_time);
                                 }
                             }
                             None => {
@@ -1616,7 +1612,7 @@ mod app {
                             alarm: ALARMS[i].iter(),
                             iter: ALARMS[i].iter(),
                         };
-                        buzzer.set_period(BUZZER_BASE_FREQ_HZ.hz());
+                        buzzer.set_period(BUZZER_BASE_FREQ_HZ.Hz());
                         buzzer.enable(Channel::C1);
                         buzzer::spawn(BuzzerEvent::Next).unwrap();
                     }
@@ -1632,7 +1628,7 @@ mod app {
                         }
 
                         *s = BuzzerState::Say;
-                        buzzer.set_period(32000.hz());
+                        buzzer.set_period(32000.Hz());
                         buzzer.enable(Channel::C1);
                         if let Some(handle) = handle.take() {
                             handle.cancel().ok();
@@ -1663,7 +1659,7 @@ mod app {
                                     buzzer.disable(Channel::C1);
                                     *is_on = false;
                                 } else {
-                                    buzzer.set_period(BUZZER_BASE_FREQ_HZ.hz());
+                                    buzzer.set_period(BUZZER_BASE_FREQ_HZ.Hz());
                                     buzzer.enable(Channel::C1);
                                     *is_on = true;
                                 }
@@ -1696,7 +1692,7 @@ mod app {
                                     dur
                                 );
                                 if *freq > 0 {
-                                    buzzer.set_period((*freq as u32).hz());
+                                    buzzer.set_period((*freq as u32).Hz());
                                     buzzer.enable(Channel::C1);
                                 }
                                 *is_pause = true;
@@ -1758,7 +1754,7 @@ mod app {
                             chime: None,
                         };
                     } else {
-                        buzzer.set_duty(Channel::C1, ((y + 5000000) / 2500) as u16);
+                        buzzer.set_duty(Channel::C1, ((y + 5000000) / 2300) as u16);
                         *handle = buzzer::spawn_at(next_run, BuzzerEvent::Next).ok();
                     }
                 }
@@ -2154,7 +2150,7 @@ mod app {
 
     #[idle(local = [led, wdg])]
     fn idle(cx: idle::Context) -> ! {
-        cx.local.wdg.start(4000.ms());
+        cx.local.wdg.start(4000.millis());
 
         loop {
             cx.local.led.set_high();
