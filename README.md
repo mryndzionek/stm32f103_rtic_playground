@@ -9,11 +9,22 @@ Not much to say about this. Just a simple app controlling an I2C OLED display.
 
 ## [gps_alarm_clock.rs](src/bin/gps_alarm_clock.rs)
 
-More real world application - GPS-based alarm clock with an I2C OLED display
-and an WS2812 LED matrix. Not very clean yet, but works.
-I admit, this was a struggle:
+More of a real-world application - GPS-synchronized alarm clock:
 
- - the app in `release` is about 90kB of flash
+ - big WS2812 LED strip display
+ - IR remote controlled
+ - DST flag and alarms kept in simulated EEPROM
+ - Nokia RTTTL alarms (need to be converted to a list of frequencies)
+ - talking clock function (speech synthesized using LPC via PWM output,
+   for more details see [here](https://github.com/mryndzionek/dsp_experiments/tree/main/lpc_encoder)
+   and [here](https://github.com/mryndzionek/dsp_experiments/tree/main/lpc_decoder))
+ - different display effects
+
+![GPS_clock](assets/gps_clock.png)
+
+Encountered problems:
+
+ - the app in `release` is about 120kB of flash
  - the ISRs a slower than in C, so I couldn't for example communicate with GPS at 115200
  - WS2812 communication is fast enough only in `release` and 's'/'z' optimization destroys the timing
 
