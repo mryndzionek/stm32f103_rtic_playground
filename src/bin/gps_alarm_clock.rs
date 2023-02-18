@@ -36,12 +36,11 @@ mod app {
     use stm32f1xx_hal::{
         dma::{Transfer, TxDma},
         flash::{FlashSize, Parts, SectorSize},
-        pac::TIM1,
         pac::TIM3,
         prelude::*,
         serial::{Config, Rx2, Serial},
         spi::{Mode, NoMiso, NoSck, Phase, Polarity, Spi, Spi2NoRemap},
-        timer::{Ch, Channel, PwmHz, Tim1NoRemap, Tim3NoRemap, Timer},
+        timer::{Ch, Channel, PwmHz, Tim3NoRemap, Timer},
     };
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
@@ -396,10 +395,10 @@ mod app {
     const NIGHT_RANGE: RangeInclusive<u8> = 7..=21;
     const SUNRISE_LEN: Duration = Duration::minutes(30);
     const ALARM_LEN: Duration = Duration::minutes(3);
-    const BUZZER_BASE_FREQ_HZ: u32 = 6000;
-    const DEFAULT_LED_COLOR: RGB8 = RGB8::new(255, 0, 0);
+    const BUZZER_BASE_FREQ_HZ: u32 = 5000;
+    const DEFAULT_LED_COLOR: RGB8 = RGB8::new(180, 10, 0);
     const DEFAULT_DAY_MODE: LightMode = LightMode::SOLID_COLOR {
-        color: RGB8::new(255, 0, 0),
+        color: DEFAULT_LED_COLOR,
     };
 
     const EEPROM_PARAMS: Params = Params {
@@ -543,8 +542,6 @@ mod app {
     #[shared]
     struct Shared {
         datetime: Option<PrimitiveDateTime>,
-        gps_locked: bool,
-        pps_timeout: Option<pps_timeout::SpawnHandle>,
         eeprom: EEPROM<&'static mut stm32f1xx_hal::flash::Parts>,
     }
 
@@ -585,10 +582,9 @@ mod app {
         fire: Fire,
         gradient: Gradient,
         solid: SolidColor,
-        led_pwm:
-            PwmHz<TIM1, Tim1NoRemap, Ch<0>, stm32f1xx_hal::gpio::gpioa::PA8<Alternate<PushPull>>>,
         decoder: &'static mut lpc_seq_decoder_t,
         voice_rng: Rand32,
+        led_pin: stm32f1xx_hal::gpio::gpioa::PA8<Output<PushPull>>,
     }
 
     #[init(local = [flash: Option<Parts> = None,
@@ -636,7 +632,7 @@ mod app {
         )
         .split();
         rx.listen();
-        rx.listen_idle();
+        //rx.listen_idle();
 
         let mut pps = gpioa.pa1.into_pull_down_input(&mut gpioa.crl);
         pps.make_interrupt_source(&mut afio);
@@ -664,7 +660,7 @@ mod app {
         let systick = c.core.SYST;
         let mono = DwtSystick::new(&mut dcb, dwt, systick, clocks.sysclk().raw());
 
-        let parser = Parser::new().sentence_only(Sentence::RMC);
+        let parser = Parser::new().sentence_filter(Sentence::RMC | Sentence::GGA);
         let (prod, cons) = c.local.BB.try_split().unwrap();
 
         let mut eeprom = flash.eeprom(EEPROM_PARAMS);
@@ -713,14 +709,8 @@ mod app {
         );
         buzz_pwm.set_duty(Channel::C1, 20 * (buzz_pwm.get_max_duty() / 100));
 
-        let led_pin = gpioa.pa8.into_alternate_push_pull(&mut gpioa.crh);
-        let mut led_pwm = Timer::new(c.device.TIM1, &clocks).pwm_hz::<Tim1NoRemap, _, _>(
-            led_pin,
-            &mut afio.mapr,
-            250.Hz(),
-        );
-        led_pwm.set_duty(Channel::C1, 0);
-        led_pwm.enable(Channel::C1);
+        let mut led_pin = gpioa.pa8.into_push_pull_output(&mut gpioa.crh);
+        led_pin.set_high();
 
         let mut pin = gpiob.pb0.into_floating_input(&mut gpiob.crl);
         pin.make_interrupt_source(&mut afio);
@@ -737,16 +727,12 @@ mod app {
         let gradient = Gradient::new();
         let solid = SolidColor::new(DEFAULT_LED_COLOR);
 
-        led_pwm::spawn().unwrap();
-
         let decoder = unsafe { lpc_seq_decoder_new() };
         let voice_rng = Rand32::new(664);
 
         (
             Shared {
                 datetime: None,
-                gps_locked: false,
-                pps_timeout: None,
                 eeprom,
             },
             Local {
@@ -767,9 +753,9 @@ mod app {
                 fire,
                 gradient,
                 solid,
-                led_pwm,
                 decoder: unsafe { &mut *decoder },
                 voice_rng,
+                led_pin,
             },
             init::Monotonics(mono),
         )
@@ -779,6 +765,7 @@ mod app {
     fn usart2(cx: usart2::Context) {
         let rx = cx.local.rx;
         let prod = cx.local.prod;
+
         if rx.is_rx_not_empty() {
             match nb::block!(rx.read()) {
                 Ok(b) => {
@@ -793,9 +780,6 @@ mod app {
                     defmt::error!("usart error!!! {}", SerialErrorWrapper(e));
                 }
             }
-            rx.listen_idle();
-        } else if rx.is_idle() {
-            rx.unlisten_idle();
         }
     }
 
@@ -829,39 +813,12 @@ mod app {
         }
     }
 
-    #[task(local = [led_pwm, i: usize = 0, dir: bool = false], priority = 16, capacity = 1)]
-    fn led_pwm(cx: led_pwm::Context) {
-        if *cx.local.dir {
-            *cx.local.i -= 1;
-            if *cx.local.i == 28 {
-                *cx.local.dir = false;
-            }
-        } else {
-            *cx.local.i += 1;
-            if *cx.local.i == 128 {
-                *cx.local.dir = true;
-            }
-        }
-
-        let s = (GAMMA8[*cx.local.i] as u32) * (cx.local.led_pwm.get_max_duty() as u32) / 255;
-        cx.local
-            .led_pwm
-            .set_duty(Channel::C1, s.try_into().unwrap());
-        led_pwm::spawn_after(50.millis()).unwrap();
-    }
-
-    #[task(shared = [datetime, pps_timeout, gps_locked], local = [cons, parser], priority = 2, capacity = 1)]
+    #[task(shared = [datetime], local = [cons, parser, led_pin], priority = 2, capacity = 1)]
     fn parse(cx: parse::Context) {
         let cons = cx.local.cons;
         let parser = cx.local.parser;
 
-        let parse::SharedResources {
-            mut datetime,
-            pps_timeout,
-            gps_locked,
-        } = cx.shared;
-
-        let mut res1 = (gps_locked, pps_timeout);
+        let parse::SharedResources { mut datetime } = cx.shared;
 
         if let Ok(rgr) = cons.read() {
             defmt::trace!("{}", &rgr.buf());
@@ -869,17 +826,6 @@ mod app {
             for result in parser.parse_from_bytes(&rgr) {
                 match result {
                     Ok(ParseResult::RMC(Some(rmc))) => {
-                        res1.lock(|gps_locked, pps_timeout| {
-                            if *gps_locked {
-                                if let Some(handle) = pps_timeout.take() {
-                                    handle.cancel().ok();
-                                }
-                            } else {
-                                *gps_locked = true;
-                                defmt::info!("GPS lock acquired");
-                            }
-                        });
-
                         let nmea0183::datetime::Date { day, month, year } = rmc.datetime.date;
                         let nmea0183::datetime::Time {
                             hours,
@@ -925,6 +871,13 @@ mod app {
                             LongitudeWrapper(gga.longitude.clone()),
                             LatitudeWrapper(gga.latitude.clone())
                         );
+                        if [nmea0183::GPSQuality::GPS, nmea0183::GPSQuality::DGPS]
+                            .contains(&gga.gps_quality)
+                        {
+                            cx.local.led_pin.set_low();
+                        } else {
+                            cx.local.led_pin.set_high();
+                        }
                         defmt::debug!(
                             "sats in use {}, quality {}",
                             gga.sat_in_use,
@@ -945,15 +898,10 @@ mod app {
         }
     }
 
-    #[task(binds = EXTI1, shared = [datetime, gps_locked, pps_timeout, eeprom],
+    #[task(binds = EXTI1, shared = [datetime, eeprom],
                            local = [pps, dst], priority = 16)]
     fn pps_isr(cx: pps_isr::Context) {
-        let pps_isr::SharedResources {
-            datetime,
-            gps_locked,
-            pps_timeout,
-            eeprom,
-        } = cx.shared;
+        let pps_isr::SharedResources { datetime, eeprom } = cx.shared;
 
         let pps = cx.local.pps;
 
@@ -961,38 +909,26 @@ mod app {
             pps.clear_interrupt_pending_bit();
 
             defmt::debug!("pps");
-            let (dt, gps) = (datetime, gps_locked, pps_timeout, eeprom).lock(
-                |dt, gps_locked, pps_timeout, eeprom| {
-                    if let Some(mut dt_) = *dt {
-                        *dt = Some(dt_ + Duration::SECOND);
-                        dt_ += Duration::SECOND;
-                        // TODO local.offset needs to be saved into persistent memory
-                        let dst_change = dst_adjust(dt_ + UTC_OFFSET + *cx.local.dst);
-                        if dst_change != Duration::ZERO {
-                            *cx.local.dst += dst_change;
-                            eeprom
-                                .write(0, cx.local.dst.whole_hours().try_into().unwrap())
-                                .unwrap();
-                        }
-                        dt_ += UTC_OFFSET + *cx.local.dst;
-                        if *gps_locked {
-                            *pps_timeout = pps_timeout::spawn_after(900.millis()).ok();
-                        }
-                        (Some(dt_), *gps_locked)
-                    } else {
-                        (None, *gps_locked)
+            let dt = (datetime, eeprom).lock(|dt, eeprom| {
+                if let Some(mut dt_) = *dt {
+                    *dt = Some(dt_ + Duration::SECOND);
+                    dt_ += Duration::SECOND;
+                    // TODO local.offset needs to be saved into persistent memory
+                    let dst_change = dst_adjust(dt_ + UTC_OFFSET + *cx.local.dst);
+                    if dst_change != Duration::ZERO {
+                        *cx.local.dst += dst_change;
+                        eeprom
+                            .write(0, cx.local.dst.whole_hours().try_into().unwrap())
+                            .unwrap();
                     }
-                },
-            );
-            main_sm::spawn(MainEvent::PPSTick { dt, gps_lock: gps }).unwrap();
+                    dt_ += UTC_OFFSET + *cx.local.dst;
+                    Some(dt_)
+                } else {
+                    None
+                }
+            });
+            main_sm::spawn(MainEvent::PPSTick { dt }).unwrap();
         }
-    }
-
-    #[task(shared = [gps_locked], local = [], priority = 2)]
-    fn pps_timeout(cx: pps_timeout::Context) {
-        let mut gps_locked = cx.shared.gps_locked;
-        defmt::warn!("GPS lock lost");
-        gps_locked.lock(|gps_locked| *gps_locked = false)
     }
 
     fn char_to_segs(c: char) -> u8 {
@@ -1027,7 +963,7 @@ mod app {
             'X' => 0b1011011,
             'y' => 0b0111011,
             'Z' => 0b1101101,
-            '?' | _ => 0b0010111,
+            _ => 0b0010111,
         }
     }
 
@@ -1566,15 +1502,12 @@ mod app {
                 if m == 0 {
                     v.push(lpc_get_seq(lpc_seq_e_LPC_ZERO)).ok()?;
                 }
-                v.push(lpc_get_seq((lpc_seq_e_LPC_ZERO + (m as u32)).into()))
-                    .ok()?;
+                v.push(lpc_get_seq(lpc_seq_e_LPC_ZERO + (m as u32))).ok()?;
             } else {
-                v.push(lpc_get_seq(
-                    (lpc_seq_e_LPC_OSIEMNASCIE + ((m / 10) as u32)).into(),
-                ))
-                .ok()?;
+                v.push(lpc_get_seq(lpc_seq_e_LPC_OSIEMNASCIE + ((m / 10) as u32)))
+                    .ok()?;
                 if (m % 10) > 0 {
-                    v.push(lpc_get_seq((lpc_seq_e_LPC_ZERO + ((m % 10) as u32)).into()))
+                    v.push(lpc_get_seq(lpc_seq_e_LPC_ZERO + ((m % 10) as u32)))
                         .ok()?;
                 }
             }
@@ -1739,19 +1672,13 @@ mod app {
                 }
                 _ => {}
             },
-            BuzzerState::Say => match ev {
-                BuzzerEvent::Next => {
+            BuzzerState::Say => {
+                if ev == BuzzerEvent::Next {
                     let mut y = 0;
                     let finished = unsafe {
                         lpc_seq_decoder_exec(decoder, rng.rand_u32(), &mut y as *mut fix16_t)
                     };
                     if finished {
-                        defmt::error!(
-                            "{} - {} {}",
-                            *cx.local.y_min,
-                            *cx.local.y_max,
-                            buzzer.get_max_duty()
-                        );
                         buzzer.disable(Channel::C1);
                         *s = BuzzerState::Chime {
                             is_on: false,
@@ -1762,8 +1689,7 @@ mod app {
                         *handle = buzzer::spawn_at(next_run, BuzzerEvent::Next).ok();
                     }
                 }
-                _ => {}
-            },
+            }
         }
     }
 
@@ -1849,13 +1775,8 @@ mod app {
     #[derive(Debug)]
     pub enum MainEvent {
         Timeout,
-        PPSTick {
-            dt: Option<PrimitiveDateTime>,
-            gps_lock: bool,
-        },
-        Remote {
-            btn: Action,
-        },
+        PPSTick { dt: Option<PrimitiveDateTime> },
+        Remote { btn: Action },
     }
 
     fn pps_tick_handler(
@@ -1978,7 +1899,7 @@ mod app {
                     }
                     *cx.local.handle = main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
                 }
-                MainEvent::PPSTick { dt, gps_lock: _ } => {
+                MainEvent::PPSTick { dt } => {
                     if dt.is_some() {
                         if let Some(handle) = cx.local.handle.take() {
                             handle.cancel().ok();
@@ -1991,7 +1912,7 @@ mod app {
             },
             MainState::TimeDisplay => {
                 match ev {
-                    MainEvent::PPSTick { dt, gps_lock: _ } => {
+                    MainEvent::PPSTick { dt } => {
                         pps_tick_handler(dt, curr_mode, cx.local.alarm_dur);
                         *datetime = dt;
                         if let Some(dt) = *datetime {
@@ -2079,7 +2000,7 @@ mod app {
                         Nine => {
                             if let Some(dt) = *datetime {
                                 let (h, m, _) = dt.as_hms();
-                                buzzer::spawn(BuzzerEvent::Say { h: h, m: m }).unwrap();
+                                buzzer::spawn(BuzzerEvent::Say { h, m }).unwrap();
                             }
                         }
                         _ => {
@@ -2098,7 +2019,7 @@ mod app {
                 }
             }
             MainState::AlarmSetting => match ev {
-                MainEvent::PPSTick { dt: _, gps_lock: _ } => {}
+                MainEvent::PPSTick { dt: _ } => {}
                 MainEvent::Remote { btn } => match btn {
                     One => {
                         let (h, m, _) = alarm_time.as_hms();
