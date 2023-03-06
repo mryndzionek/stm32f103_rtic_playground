@@ -3,5 +3,6 @@
 
 #include "lpc.h"
 #include "fix.h"
+#include "hilbert.h"
 
 #endif

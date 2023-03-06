@@ -10,6 +10,7 @@ mod app {
     use core::iter::Peekable;
     use core::ops::RangeInclusive;
     use core::slice::Iter;
+    use cortex_m::singleton;
     use defmt::{write, Debug2Format, Format, Formatter};
     use dwt_systick_monotonic::{DwtSystick, ExtU32};
     use eeprom::{EEPROMExt, Params, EEPROM};
@@ -29,18 +30,19 @@ mod app {
     use smart_leds::RGB8;
     use stm32f103_rtic_playground as _;
     use stm32f1xx_hal::gpio::{
-        gpioa::PA1, gpiob::PB0, gpioc::PC13, Alternate, Edge, ExtiPin, Floating, Input, Output,
-        PullDown, PushPull,
+        gpioa::PA1, gpiob::PB0, gpioc::PC13, Alternate, Analog, Edge, ExtiPin, Floating, Input,
+        Output, Pin, PullDown, PushPull, CRL,
     };
     use stm32f1xx_hal::watchdog::IndependentWatchdog;
     use stm32f1xx_hal::{
-        dma::{Transfer, TxDma},
+        adc::{Adc, AdcPayload, Continuous, SampleTime},
+        dma::{dma1::C1, RxDma, Transfer, TxDma, W},
         flash::{FlashSize, Parts, SectorSize},
-        pac::TIM3,
+        pac::{ADC1, TIM2, TIM3},
         prelude::*,
         serial::{Config, Rx2, Serial},
         spi::{Mode, NoMiso, NoSck, Phase, Polarity, Spi, Spi2NoRemap},
-        timer::{Ch, Channel, PwmHz, Tim3NoRemap, Timer},
+        timer::{Ch, Channel, CounterHz, Event, PwmHz, Tim3NoRemap, Timer},
     };
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
@@ -585,6 +587,14 @@ mod app {
         decoder: &'static mut lpc_seq_decoder_t,
         voice_rng: Rand32,
         led_pin: stm32f1xx_hal::gpio::gpioa::PA8<Output<PushPull>>,
+        timer: CounterHz<TIM2>,
+        adc_xfer: Option<
+            Transfer<
+                W,
+                &'static mut [u16; 1],
+                RxDma<AdcPayload<ADC1, Pin<Analog, CRL, 'A', 0>, Continuous>, C1>,
+            >,
+        >,
     }
 
     #[init(local = [flash: Option<Parts> = None,
@@ -610,6 +620,7 @@ mod app {
             .use_hse(8.MHz())
             .sysclk(FREQ.Hz())
             .pclk1(36.MHz())
+            .adcclk(14.MHz())
             .freeze(&mut flash.acr);
         let mut afio = c.device.AFIO.constrain();
 
@@ -719,6 +730,18 @@ mod app {
 
         let receiver = Receiver::with_fugit(pin);
 
+        let mut adc1 = Adc::adc1(c.device.ADC1, clocks);
+        adc1.set_sample_time(SampleTime::T_7);
+        let adc_ch0 = gpioa.pa0.into_analog(&mut gpioa.crl);
+        let adc_dma = adc1.with_dma(adc_ch0, dma.1);
+
+        let adc_buf = singleton!(: [u16; 1] = [0; 1]).unwrap();
+        let adc_xfer = adc_dma.read(adc_buf);
+
+        let mut timer = c.device.TIM2.counter_hz(&clocks);
+        timer.start(24.kHz()).unwrap();
+        timer.listen(Event::Update);
+
         let wdg = IndependentWatchdog::new(c.device.IWDG);
         main_sm::spawn(MainEvent::Timeout).unwrap();
         buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
@@ -728,6 +751,7 @@ mod app {
         let solid = SolidColor::new(DEFAULT_LED_COLOR);
 
         let decoder = unsafe { lpc_seq_decoder_new() };
+
         let voice_rng = Rand32::new(664);
 
         (
@@ -756,6 +780,8 @@ mod app {
                 decoder: unsafe { &mut *decoder },
                 voice_rng,
                 led_pin,
+                timer,
+                adc_xfer: Some(adc_xfer),
             },
             init::Monotonics(mono),
         )
@@ -2073,14 +2099,55 @@ mod app {
         }
     }
 
-    #[idle(local = [led, wdg])]
+    #[task(binds = TIM2, shared = [],
+        local = [timer,
+                 adc_xfer,
+                 led,
+                 counter: usize = 0,
+                 hilb: hilb_t = hilb_t {
+                    xs: [0; 31],
+                    i: 0,
+                    j: 0,
+                }],
+        priority = 16)]
+    fn timer_task(cx: timer_task::Context) {
+        let timer = cx.local.timer;
+        cx.local.led.set_low();
+        let adc_xfer = cx.local.adc_xfer.take().unwrap();
+
+        if adc_xfer.is_done() {
+            let (buf, adc_dma) = adc_xfer.wait();
+            let x: i16 = buf[0] as i16 - 2048;
+            cx.local.adc_xfer.replace(adc_dma.read(buf));
+
+            let mut yi: i16 = 0;
+            let mut yq: i16 = 0;
+
+            unsafe { hilb_update(cx.local.hilb, x, &mut yi as *mut i16, &mut yq as *mut i16) };
+            let amp = unsafe { hilb_get_amp(yi, yq) };
+
+            *cx.local.counter += 1;
+
+            if *cx.local.counter == 24000 {
+                *cx.local.counter = 0;
+                defmt::error!("{} {}", amp, x);
+            }
+        } else {
+            defmt::panic!();
+        }
+
+        cx.local.led.set_high();
+        timer.clear_interrupt(Event::Update);
+    }
+
+    #[idle(local = [wdg])]
     fn idle(cx: idle::Context) -> ! {
         cx.local.wdg.start(4000.millis());
 
         loop {
-            cx.local.led.set_high();
+            //cx.local.led.set_high();
             rtic::export::wfi();
-            cx.local.led.set_low();
+            //cx.local.led.set_low();
             cx.local.wdg.feed();
         }
     }

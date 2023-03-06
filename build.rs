@@ -35,4 +35,9 @@ fn main() {
         .file("c/lpc.c")
         .file("c/lpc_data.c")
         .compile("liblpc.a");
+
+    cc::Build::new()
+        .define("NDEBUG", None)
+        .file("c/hilbert.c")
+        .compile("libhilbert.a");
 }

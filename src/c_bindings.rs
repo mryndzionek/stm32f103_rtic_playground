@@ -202,12 +202,13 @@ pub const __have_pthread_attr_t: u32 = 1;
 pub const _ALLOCA_H: u32 = 1;
 pub const FIX_ONE: u32 = 1048576;
 pub const FIX_ZERO: u32 = 0;
-pub const LPC_ORDER: u32 = 6;
+pub const LPC_ORDER: u32 = 8;
 pub const LPC_FRAME_LEN: u32 = 440;
 pub const LPC_SAMPLE_RATE: u32 = 11000;
 pub const LPC_DEEMPHASIS_FACTOR: u32 = 1019052;
 pub const MAX_LPC_OBJECTS: u32 = 2;
 pub const MAX_DECODER_SEQ: u32 = 5;
+pub const NUM_TAPS: u32 = 31;
 pub type __u_char = cty::c_uchar;
 pub type __u_short = cty::c_ushort;
 pub type __u_int = cty::c_uint;
@@ -324,6 +325,7 @@ pub type idtype_t = cty::c_uint;
 pub type _Float32 = f32;
 pub type _Float64 = f64;
 pub type _Float32x = f64;
+pub type _Float64x = u128;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct div_t {
@@ -2177,6 +2179,14 @@ extern "C" {
     pub fn getloadavg(__loadavg: *mut f64, __nelem: cty::c_int) -> cty::c_int;
 }
 pub type fix16_t = i32;
+#[repr(C)]
+#[repr(align(16))]
+#[derive(Debug, Copy, Clone)]
+pub struct max_align_t {
+    pub __clang_max_align_nonce1: cty::c_longlong,
+    pub __bindgen_padding_0: u64,
+    pub __clang_max_align_nonce2: u128,
+}
 #[test]
 fn bindgen_test_layout_max_align_t() {
     assert_eq!(
@@ -2219,13 +2229,13 @@ fn bindgen_test_layout_max_align_t() {
 pub struct lpc_frame_t {
     pub g: i16,
     pub ps: u8,
-    pub a: [i16; 6usize],
+    pub a: [i16; 8usize],
 }
 #[test]
 fn bindgen_test_layout_lpc_frame_t() {
     assert_eq!(
         ::core::mem::size_of::<lpc_frame_t>(),
-        16usize,
+        20usize,
         concat!("Size of: ", stringify!(lpc_frame_t))
     );
     assert_eq!(
@@ -2390,4 +2400,54 @@ extern "C" {
 }
 extern "C" {
     pub fn lpc_seq_decoder_exec(self_: *mut lpc_seq_decoder_t, rnd: u32, y: *mut fix16_t) -> bool;
+}
+pub type q15_t = i16;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct hilb_t {
+    pub xs: [q15_t; 31usize],
+    pub i: size_t,
+    pub j: size_t,
+}
+#[test]
+fn bindgen_test_layout_hilb_t() {
+    assert_eq!(
+        ::core::mem::size_of::<hilb_t>(),
+        80usize,
+        concat!("Size of: ", stringify!(hilb_t))
+    );
+    assert_eq!(
+        ::core::mem::align_of::<hilb_t>(),
+        8usize,
+        concat!("Alignment of ", stringify!(hilb_t))
+    );
+    assert_eq!(
+        unsafe { &(*(::core::ptr::null::<hilb_t>())).xs as *const _ as usize },
+        0usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(hilb_t),
+            "::",
+            stringify!(xs)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::core::ptr::null::<hilb_t>())).i as *const _ as usize },
+        64usize,
+        concat!("Offset of field: ", stringify!(hilb_t), "::", stringify!(i))
+    );
+    assert_eq!(
+        unsafe { &(*(::core::ptr::null::<hilb_t>())).j as *const _ as usize },
+        72usize,
+        concat!("Offset of field: ", stringify!(hilb_t), "::", stringify!(j))
+    );
+}
+extern "C" {
+    pub fn hilb_init(f: *mut hilb_t);
+}
+extern "C" {
+    pub fn hilb_update(f: *mut hilb_t, x: q15_t, yi: *mut q15_t, yq: *mut q15_t);
+}
+extern "C" {
+    pub fn hilb_get_amp(a: q15_t, b: q15_t) -> q15_t;
 }

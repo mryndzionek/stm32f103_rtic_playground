@@ -49,7 +49,7 @@ $PQBAUD,W,38400*7B
 ## Compiling bindings
 
 ```
-bindgen --ctypes-prefix=cty --use-core c/bindings.h > src/lpc.rs
+bindgen --ctypes-prefix=cty --use-core c/bindings.h > src/c_bindings.rs
 ```
 
 

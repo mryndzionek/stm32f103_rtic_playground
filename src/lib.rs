@@ -31,4 +31,4 @@ pub fn exit() -> ! {
     }
 }
 
-include!("lpc.rs");
+include!("c_bindings.rs");
