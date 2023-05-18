@@ -193,7 +193,7 @@ mod app {
     }
 
     pub trait ColorMap {
-        fn get(&self, x: usize, y: usize) -> RGB8;
+        fn get(&self, x: usize, y: usize, i: usize) -> RGB8;
     }
 
     pub struct SolidColor {
@@ -208,7 +208,7 @@ mod app {
     }
 
     impl ColorMap for SolidColor {
-        fn get(&self, _: usize, _: usize) -> RGB8 {
+        fn get(&self, _: usize, _: usize, _: usize) -> RGB8 {
             self.color
         }
     }
@@ -241,7 +241,7 @@ mod app {
     }
 
     impl ColorMap for Gradient {
-        fn get(&self, _: usize, y: usize) -> RGB8 {
+        fn get(&self, _: usize, y: usize, _: usize) -> RGB8 {
             if y < Gradient::LED_PALETTE_BRG.len() {
                 Gradient::LED_PALETTE_BRG[y]
             } else {
@@ -350,7 +350,7 @@ mod app {
     }
 
     impl<const X: usize, const Y: usize> ColorMap for FireSim<X, Y> {
-        fn get(&self, x: usize, y: usize) -> RGB8 {
+        fn get(&self, x: usize, y: usize, _: usize) -> RGB8 {
             let (y, x) = (Y - y - 2, x + 1);
             let (p1, p2) = (self.pixels[y][x] as i16, self.prev_pixels[y][x] as i16);
             let r = (self.c as i16) * (p1 - p2) / (self.slf as i16);
@@ -364,6 +364,47 @@ mod app {
                 (Fire::FIRE_PALETTE.len() - 1) as u8
             };
             Fire::FIRE_PALETTE[k as usize]
+        }
+    }
+
+    pub struct RandomSim<const N: usize> {
+        pixels: [u16; N],
+        rng: Rand32,
+    }
+
+    impl<const N: usize> RandomSim<N> {
+        #[inline]
+        fn new(seed: u64) -> Self {
+            let mut pixels = [(SUPER_LED_COUNT_PERIOD / 2) as u16; N];
+            let mut rng = Rand32::new(seed);
+            for i in 0..N {
+                pixels[i] =
+                    (SUPER_LED_COUNT_PERIOD - rng.rand_range(0..SUPER_LED_COUNT_PERIOD)) as u16;
+            }
+            Self { pixels, rng }
+        }
+
+        fn update(&mut self) {
+            for i in 0..N {
+                self.pixels[i] -= 1;
+                if self.pixels[i] == 0 {
+                    self.pixels[i] = (SUPER_LED_COUNT_PERIOD + self.rng.rand_range(0..20)) as u16;
+                }
+            }
+        }
+    }
+
+    impl<const N: usize> ColorMap for RandomSim<N> {
+        fn get(&self, _: usize, _: usize, i: usize) -> RGB8 {
+            if self.pixels[i] > ((SUPER_LED_COUNT_PERIOD / 2) + 10) as u16 {
+                RGB8::new(0, 0, 10)
+            } else if self.pixels[i] > (SUPER_LED_COUNT_PERIOD / 2) as u16 {
+                RGB8::new(60, 0, 0)
+            } else if self.pixels[i] > 11 {
+                RGB8::new(0, 0, 1)
+            } else {
+                RGB8::new(0, 0, 30)
+            }
         }
     }
 
@@ -400,6 +441,7 @@ mod app {
     const DEFAULT_DAY_MODE: LightMode = LightMode::SOLID_COLOR {
         color: DEFAULT_LED_COLOR,
     };
+    const SUPER_LED_COUNT_PERIOD: u32 = 5500 / 5;
 
     const EEPROM_PARAMS: Params = Params {
         first_page: 126,
@@ -511,6 +553,7 @@ mod app {
         SOLID_COLOR { color: RGB8 },
         GRADIENT,
         FIRE,
+        SUPER,
     }
 
     #[derive(Debug)]
@@ -561,6 +604,7 @@ mod app {
 
     type Xfer = Transfer<stm32f1xx_hal::dma::R, &'static [u8; LEDS_BUF_SIZE], Leds>;
     type Fire = FireSim<{ (DIGIT_WIDTH * NUM_DIGITS) + 2 + 2 + 2 }, { DIGIT_HEIGHT + 2 }>;
+    type SuperComp = RandomSim<{ NUM_LEDS }>;
 
     #[local]
     struct Local {
@@ -580,6 +624,7 @@ mod app {
         leds: [RGB8; NUM_LEDS],
         receiver: IrReceiver,
         fire: Fire,
+        super_comp: SuperComp,
         gradient: Gradient,
         solid: SolidColor,
         decoder: &'static mut lpc_seq_decoder_t,
@@ -723,7 +768,8 @@ mod app {
         main_sm::spawn(MainEvent::Timeout).unwrap();
         buzzer::spawn(BuzzerEvent::QuarterChime).unwrap();
 
-        let fire = FireSim::new(666, 15);
+        let fire = FireSim::new(666, 35);
+        let super_comp = SuperComp::new(667);
         let gradient = Gradient::new();
         let solid = SolidColor::new(DEFAULT_LED_COLOR);
 
@@ -751,6 +797,7 @@ mod app {
                 leds,
                 receiver,
                 fire,
+                super_comp,
                 gradient,
                 solid,
                 decoder: unsafe { &mut *decoder },
@@ -1039,6 +1086,7 @@ mod app {
 
     #[task(local = [ws, leds, is_trans: bool = false,
                     fire,
+                    super_comp,
                     gradient,
                     solid,
                     mode: LightMode = DEFAULT_DAY_MODE,
@@ -1056,6 +1104,7 @@ mod app {
         let trans_state = cx.local.trans_state;
         let handle = cx.local.handle;
         let fire = cx.local.fire;
+        let super_comp = cx.local.super_comp;
 
         match ev {
             LightEvent::DIGITS {
@@ -1113,6 +1162,7 @@ mod app {
                         cx.local.solid
                     }
                     LightMode::FIRE => fire,
+                    LightMode::SUPER => super_comp,
                 };
 
                 if col1 {
@@ -1132,6 +1182,8 @@ mod app {
             LightEvent::TIMEOUT => {
                 if *cx.local.mode == LightMode::FIRE {
                     fire.update();
+                } else if *cx.local.mode == LightMode::SUPER {
+                    super_comp.update();
                 }
 
                 defmt::assert!(*is_trans);
@@ -1145,6 +1197,7 @@ mod app {
                     LightMode::GRADIENT => cx.local.gradient,
                     LightMode::SOLID_COLOR { .. } => cx.local.solid,
                     LightMode::FIRE => fire,
+                    LightMode::SUPER => super_comp,
                 };
 
                 for (x, d) in (*trans_state).iter().rev().enumerate() {
@@ -1159,13 +1212,6 @@ mod app {
         }
     }
 
-    pub enum AmSensorState {
-        START1,
-        START2,
-        ACK1,
-        ACK2,
-        RX,
-    }
     pub enum BuzzerState {
         Chime {
             is_on: bool,
@@ -1715,7 +1761,7 @@ mod app {
             let (o, l) = SEG_TO_OFFSET[i];
             for (i, l) in leds.iter_mut().skip(dx + o).take(l).enumerate() {
                 let (x, y) = LED_POS_TO_XY[o + i];
-                let c = cmap.get(ddx + x as usize, y as usize);
+                let c = cmap.get(ddx + x as usize, y as usize, dx + o + i);
                 *l = dim_color(c, *s);
             }
         }
@@ -1725,7 +1771,7 @@ mod app {
         let offset = 2 * DIGIT_LEN + ((2 * DIGIT_LEN) + COLON_LEN) * x;
         for (i, l) in leds.iter_mut().skip(offset).take(COLON_LEN).enumerate() {
             let (x, y) = COLON_POS_TO_XY[(x * COLON_LEN) + i];
-            let c = cmap.get(x as usize, y as usize);
+            let c = cmap.get(x as usize, y as usize, offset + i);
             *l = dim_color(c, b);
         }
     }
@@ -1979,6 +2025,14 @@ mod app {
                         Five => {
                             *curr_mode = OperatingMode::DAY {
                                 mode: LightMode::FIRE,
+                            };
+                            if let Some(dt) = *datetime {
+                                disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                            }
+                        }
+                        Seven => {
+                            *curr_mode = OperatingMode::DAY {
+                                mode: LightMode::SUPER,
                             };
                             if let Some(dt) = *datetime {
                                 disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
