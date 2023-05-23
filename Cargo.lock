@@ -246,6 +246,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ds18b20"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cd37ace0416c30c2874cd67135508de493e34135c67878b01e13aba91b53ce"
+dependencies = [
+ "embedded-hal",
+ "one-wire-bus",
+]
+
+[[package]]
 name = "dwt-systick-monotonic"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -434,6 +444,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "578ede34cf02f8924ab9447f50c28075b4d3e5b269972345e7e0372b38c6cdcd"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "one-wire-bus"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9761e13074f8f916702c1a1dbe0eda3fb8478704db00493f5a5c27ed5847710"
+dependencies = [
+ "embedded-hal",
 ]
 
 [[package]]
@@ -662,6 +681,7 @@ dependencies = [
  "cty",
  "defmt",
  "defmt-rtt",
+ "ds18b20",
  "dwt-systick-monotonic",
  "eeprom",
  "embedded-graphics",
@@ -669,6 +689,7 @@ dependencies = [
  "infrared",
  "nb 1.1.0",
  "nmea0183",
+ "one-wire-bus",
  "oorandom",
  "panic-probe",
  "profont",

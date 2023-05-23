@@ -33,6 +33,8 @@ bresenham = "0.1"
 oorandom = "11.1"
 
 cty = "0.2"
+one-wire-bus = "0.1.1"
+ds18b20 = "0.1.1"
 
 [build-dependencies]
 cc = "1.0"

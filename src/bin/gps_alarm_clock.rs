@@ -28,6 +28,7 @@ mod app {
     use rtic::Monotonic;
     use smart_leds::RGB8;
     use stm32f103_rtic_playground as _;
+    use stm32f1xx_hal::gpio::OpenDrain;
     use stm32f1xx_hal::gpio::{
         gpioa::PA1, gpiob::PB0, gpioc::PC13, Alternate, Edge, ExtiPin, Floating, Input, Output,
         PullDown, PushPull,
@@ -36,15 +37,17 @@ mod app {
     use stm32f1xx_hal::{
         dma::{Transfer, TxDma},
         flash::{FlashSize, Parts, SectorSize},
-        pac::TIM3,
+        pac::{TIM2, TIM3},
         prelude::*,
         serial::{Config, Rx2, Serial},
         spi::{Mode, NoMiso, NoSck, Phase, Polarity, Spi, Spi2NoRemap},
-        timer::{Ch, Channel, PwmHz, Tim3NoRemap, Timer},
+        timer::{Ch, Channel, Delay, PwmHz, Tim3NoRemap, Timer},
     };
     use time::macros::time;
     use time::{Date, Duration, Month, PrimitiveDateTime, Time, Weekday};
 
+    use ds18b20::{Ds18b20, Resolution};
+    use one_wire_bus::OneWire;
     use stm32f103_rtic_playground::*;
 
     #[derive(Debug, Default)]
@@ -260,7 +263,7 @@ mod app {
 
     impl<const X: usize, const Y: usize> FireSim<X, Y> {
         const FIRE_PALETTE: [RGB8; 40] = [
-            RGB8::new(11, 0, 0),
+            RGB8::new(5, 0, 0),
             RGB8::new(24, 0, 0),
             RGB8::new(37, 0, 0),
             RGB8::new(50, 0, 0),
@@ -368,18 +371,17 @@ mod app {
     }
 
     pub struct RandomSim<const N: usize> {
-        pixels: [u16; N],
+        pixels: [u8; N],
         rng: Rand32,
     }
 
     impl<const N: usize> RandomSim<N> {
         #[inline]
         fn new(seed: u64) -> Self {
-            let mut pixels = [(SUPER_LED_COUNT_PERIOD / 2) as u16; N];
+            let mut pixels = [(SUPER_LED_COUNT_PERIOD / 2) as u8; N];
             let mut rng = Rand32::new(seed);
-            for i in 0..N {
-                pixels[i] =
-                    (SUPER_LED_COUNT_PERIOD - rng.rand_range(0..SUPER_LED_COUNT_PERIOD)) as u16;
+            for p in pixels.iter_mut() {
+                *p = (SUPER_LED_COUNT_PERIOD - rng.rand_range(0..SUPER_LED_COUNT_PERIOD)) as u8;
             }
             Self { pixels, rng }
         }
@@ -388,7 +390,7 @@ mod app {
             for i in 0..N {
                 self.pixels[i] -= 1;
                 if self.pixels[i] == 0 {
-                    self.pixels[i] = (SUPER_LED_COUNT_PERIOD + self.rng.rand_range(0..20)) as u16;
+                    self.pixels[i] = (SUPER_LED_COUNT_PERIOD - self.rng.rand_range(0..20)) as u8;
                 }
             }
         }
@@ -396,9 +398,9 @@ mod app {
 
     impl<const N: usize> ColorMap for RandomSim<N> {
         fn get(&self, _: usize, _: usize, i: usize) -> RGB8 {
-            if self.pixels[i] > ((SUPER_LED_COUNT_PERIOD / 2) + 10) as u16 {
+            if self.pixels[i] > ((SUPER_LED_COUNT_PERIOD / 2) + 10) as u8 {
                 RGB8::new(0, 0, 10)
-            } else if self.pixels[i] > (SUPER_LED_COUNT_PERIOD / 2) as u16 {
+            } else if self.pixels[i] > (SUPER_LED_COUNT_PERIOD / 2) as u8 {
                 RGB8::new(60, 0, 0)
             } else if self.pixels[i] > 11 {
                 RGB8::new(0, 0, 1)
@@ -441,7 +443,9 @@ mod app {
     const DEFAULT_DAY_MODE: LightMode = LightMode::SOLID_COLOR {
         color: DEFAULT_LED_COLOR,
     };
-    const SUPER_LED_COUNT_PERIOD: u32 = 5500 / 5;
+    const TEMP_MODE: LightMode = DEFAULT_DAY_MODE;
+    const SUPER_LED_COUNT_PERIOD: u32 = 255;
+    const NUM_OW_SENSORS: usize = 2;
 
     const EEPROM_PARAMS: Params = Params {
         first_page: 126,
@@ -586,6 +590,7 @@ mod app {
     struct Shared {
         datetime: Option<PrimitiveDateTime>,
         eeprom: EEPROM<&'static mut stm32f1xx_hal::flash::Parts>,
+        temps: [Option<f32>; NUM_OW_SENSORS],
     }
 
     type Leds = TxDma<
@@ -630,6 +635,9 @@ mod app {
         decoder: &'static mut lpc_seq_decoder_t,
         voice_rng: Rand32,
         led_pin: stm32f1xx_hal::gpio::gpioa::PA8<Output<PushPull>>,
+        ow_bus: OneWire<stm32f1xx_hal::gpio::gpiob::PB11<Output<OpenDrain>>>,
+        ds18b20_adrs: [Option<one_wire_bus::Address>; NUM_OW_SENSORS],
+        ow_delay: Delay<TIM2, 1000000>,
     }
 
     #[init(local = [flash: Option<Parts> = None,
@@ -776,10 +784,29 @@ mod app {
         let decoder = unsafe { lpc_seq_decoder_new() };
         let voice_rng = Rand32::new(664);
 
+        let owpin = gpiob.pb11.into_open_drain_output(&mut gpiob.crh);
+        let mut ow_bus = OneWire::new(owpin).unwrap();
+        let mut ow_delay = c.device.TIM2.delay_us(&clocks);
+        let mut ds18b20_adrs: [Option<one_wire_bus::Address>; NUM_OW_SENSORS] =
+            [None; NUM_OW_SENSORS];
+
+        for (i, device_address) in ow_bus
+            .devices(false, &mut ow_delay)
+            .take(NUM_OW_SENSORS)
+            .enumerate()
+        {
+            if let Ok(device_address) = device_address {
+                ds18b20_adrs[i] = Some(device_address);
+                defmt::info!("{}", device_address.0);
+            }
+        }
+        ds18b20_task::spawn().unwrap();
+
         (
             Shared {
                 datetime: None,
                 eeprom,
+                temps: [None; NUM_OW_SENSORS],
             },
             Local {
                 led,
@@ -803,9 +830,45 @@ mod app {
                 decoder: unsafe { &mut *decoder },
                 voice_rng,
                 led_pin,
+                ow_bus,
+                ds18b20_adrs,
+                ow_delay,
             },
             init::Monotonics(mono),
         )
+    }
+
+    #[task(shared = [temps],
+           local = [ds18b20_adrs, ow_delay, ow_bus, state: bool = false],
+           priority = 16, capacity = 1)]
+    fn ds18b20_task(cx: ds18b20_task::Context) {
+        let addrs = cx.local.ds18b20_adrs;
+        let delay = cx.local.ow_delay;
+        let bus = cx.local.ow_bus;
+        let mut temps = cx.shared.temps;
+
+        if addrs.iter().any(|&a| a.is_some()) {
+            if *cx.local.state {
+                for (i, addr) in addrs.iter().flatten().enumerate() {
+                    let sensor = Ds18b20::new::<core::fmt::Error>(*addr);
+                    if let Ok(sensor) = sensor {
+                        let data = sensor.read_data(bus, delay);
+                        if let Ok(data) = data {
+                            temps.lock(|temps| temps[i] = Some(data.temperature));
+                            defmt::error!("{} {}", sensor.address().0, data.temperature);
+                        }
+                    }
+                }
+                *cx.local.state = false;
+                ds18b20_task::spawn_after(10000.millis()).unwrap();
+            } else if let Ok(()) = ds18b20::start_simultaneous_temp_measurement(bus, delay) {
+                *cx.local.state = true;
+                ds18b20_task::spawn_after(
+                    (Resolution::Bits12.max_measurement_time_millis() as u32).millis(),
+                )
+                .unwrap();
+            }
+        }
     }
 
     #[task(binds = USART2, shared = [], local = [rx, prod], priority = 16)]
@@ -1816,6 +1879,7 @@ mod app {
         NoSync { s: bool },
         TimeDisplay,
         AlarmSetting,
+        TempDisplay,
     }
 
     #[derive(Debug)]
@@ -1900,11 +1964,48 @@ mod app {
         .unwrap();
     }
 
+    fn display_temp(temps: &mut [Option<f32>; NUM_OW_SENSORS]) -> LightEvent {
+        let mut buf: String<NUM_DIGITS> = String::new();
+        let mut cols = [false; NUM_OW_SENSORS];
+
+        for (temp, col) in temps.iter_mut().zip(&mut cols) {
+            if let Some(temp) = temp {
+                if *temp < 100.0 {
+                    if *temp < 0.0 {
+                        *temp = -*temp;
+                        *col = true;
+                    }
+                    let mut tmp: String<4> = String::new();
+                    tmp.write_fmt(format_args!("{:02.1}", *temp)).unwrap();
+                    let mut tmp: [char; 4] = str_to_array(&tmp);
+                    if tmp[0] == '0' {
+                        tmp[0] = ' ';
+                    }
+                    tmp[2] = tmp[3];
+                    buf.push(tmp[0]).unwrap();
+                    buf.push(tmp[1]).unwrap();
+                    buf.push(tmp[2]).unwrap();
+                } else {
+                    buf.push_str("---").unwrap();
+                }
+            } else {
+                buf.push_str("---").unwrap();
+            }
+        }
+        let ts = str_to_array(&buf);
+        LightEvent::DIGITS {
+            dg: Some(ts),
+            col1: cols[0],
+            col2: cols[1],
+            mode: TEMP_MODE,
+        }
+    }
+
     fn str_to_array<const N: usize>(str: &str) -> [char; N] {
         str.chars().collect::<Vec<_, N>>().into_array().unwrap()
     }
 
-    #[task(shared = [eeprom], local = [
+    #[task(shared = [eeprom, temps], local = [
                                  curr_al: usize = 0,
                                  state: MainState = MainState::NoSync {s: true},
                                  handle: Option<main_sm::SpawnHandle> = None,
@@ -1920,6 +2021,7 @@ mod app {
         let curr_mode = cx.local.mode;
         let alarm_time = cx.local.alarm_time;
         let datetime = cx.local.dt;
+        let mut temps = cx.shared.temps;
 
         match state {
             MainState::NoSync { s } => match ev {
@@ -2051,6 +2153,11 @@ mod app {
                                 disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
                             }
                         }
+                        Eight => {
+                            *state = MainState::TempDisplay;
+                            let ev = temps.lock(|temps| display_temp(temps));
+                            light::spawn(ev).unwrap();
+                        }
                         Nine => {
                             if let Some(dt) = *datetime {
                                 let (h, m, _) = dt.as_hms();
@@ -2121,6 +2228,22 @@ mod app {
                     _ => {
                         defmt::error!("Unh");
                     }
+                },
+                _ => (),
+            },
+            MainState::TempDisplay => match ev {
+                MainEvent::PPSTick { dt: _ } => {
+                    let ev = temps.lock(|temps| display_temp(temps));
+                    light::spawn(ev).unwrap();
+                }
+                MainEvent::Remote { btn } => match btn {
+                    Eight => {
+                        *state = MainState::TimeDisplay;
+                        if let Some(dt) = *datetime {
+                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                        }
+                    }
+                    _ => (),
                 },
                 _ => (),
             },
