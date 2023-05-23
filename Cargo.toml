@@ -29,7 +29,6 @@ eeprom = { version = "0.3" , features = ["stm32f103"] }
 bbqueue = "0.5"
 nmea0183 = "0.3"
 time = { version = "0.3", default-features = false, features = ["macros"] }
-bresenham = "0.1"
 oorandom = "11.1"
 
 cty = "0.2"

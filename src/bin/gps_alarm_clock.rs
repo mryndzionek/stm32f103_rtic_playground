@@ -5,9 +5,7 @@
 #[rtic::app(device = stm32f1xx_hal::pac, peripherals = true, dispatchers = [PVD, WWDG, RTC, SPI1])]
 mod app {
     use bbqueue::BBBuffer;
-    use bresenham::Bresenham;
     use core::fmt::{Debug, Write};
-    use core::iter::Peekable;
     use core::ops::RangeInclusive;
     use core::slice::Iter;
     use defmt::{write, Debug2Format, Format, Formatter};
@@ -136,62 +134,6 @@ mod app {
                 _ => "Unknown error",
             };
             write!(fmt, "{}", s);
-        }
-    }
-
-    pub struct LinearRamp {
-        start: usize,
-        end: usize,
-        b: Peekable<Bresenham>,
-    }
-
-    impl LinearRamp {
-        #[inline]
-        pub fn new(start: usize, end: usize) -> LinearRamp {
-            LinearRamp {
-                start,
-                end,
-                b: Bresenham::new((0, 0), (start.try_into().unwrap(), end.try_into().unwrap()))
-                    .peekable(),
-            }
-        }
-    }
-
-    impl PartialEq for LinearRamp {
-        fn eq(&self, other: &Self) -> bool {
-            (self.start == other.start) && (self.end == other.end)
-        }
-    }
-
-    impl Iterator for LinearRamp {
-        type Item = isize;
-
-        #[inline]
-        fn next(&mut self) -> Option<Self::Item> {
-            let v;
-            loop {
-                match self.b.next() {
-                    Some((cx, cy)) => match self.b.peek() {
-                        Some((nx, _)) => {
-                            if cx != *nx {
-                                v = Some(cy);
-                                break;
-                            } else {
-                                continue;
-                            }
-                        }
-                        None => {
-                            v = Some(cy);
-                            break;
-                        }
-                    },
-                    None => {
-                        v = None;
-                        break;
-                    }
-                }
-            }
-            v
         }
     }
 
@@ -436,7 +378,6 @@ mod app {
     const LED_FADE_SPEED: u32 = 5;
     const UTC_OFFSET: Duration = Duration::HOUR;
     const NIGHT_RANGE: RangeInclusive<u8> = 7..=21;
-    const SUNRISE_LEN: Duration = Duration::minutes(30);
     const ALARM_LEN: Duration = Duration::minutes(3);
     const BUZZER_BASE_FREQ_HZ: u32 = 5000;
     const DEFAULT_LED_COLOR: RGB8 = RGB8::new(180, 10, 0);
@@ -504,38 +445,6 @@ mod app {
     const SEG_TO_OFFSET: [(usize, usize); NUM_SEGS] =
         [(0, 4), (4, 4), (8, 4), (12, 4), (16, 5), (21, 4), (25, 3)];
 
-    const SUNRISE_CMAP: [u32; 256] = [
-        0x20000, 0x70000, 0xD0000, 0x120000, 0x160000, 0x190000, 0x1C0000, 0x1F0000, 0x220000,
-        0x240000, 0x260000, 0x280000, 0x2A0000, 0x2C0000, 0x2E0000, 0x300000, 0x320000, 0x330000,
-        0x350000, 0x360000, 0x380000, 0x390000, 0x3B0000, 0x3C0000, 0x3E0000, 0x3F0000, 0x400000,
-        0x420100, 0x430100, 0x450100, 0x460100, 0x480100, 0x490100, 0x4B0100, 0x4C0100, 0x4E0100,
-        0x4F0100, 0x510100, 0x520100, 0x540100, 0x550100, 0x570100, 0x580100, 0x5A0100, 0x5B0100,
-        0x5D0100, 0x5E0100, 0x600100, 0x610100, 0x630100, 0x640100, 0x660100, 0x670100, 0x690100,
-        0x6B0200, 0x6C0200, 0x6E0200, 0x6F0200, 0x710200, 0x720200, 0x740200, 0x760200, 0x770200,
-        0x790200, 0x7A0200, 0x7C0200, 0x7E0200, 0x7F0200, 0x810200, 0x830200, 0x840300, 0x860300,
-        0x870300, 0x890300, 0x8B0300, 0x8C0300, 0x8E0300, 0x900300, 0x910300, 0x930300, 0x950300,
-        0x960400, 0x980400, 0x9A0400, 0x9B0400, 0x9D0400, 0x9F0400, 0xA00400, 0xA20400, 0xA40400,
-        0xA50500, 0xA70500, 0xA90500, 0xAB0500, 0xAC0500, 0xAE0500, 0xB00600, 0xB10600, 0xB30600,
-        0xB50600, 0xB70600, 0xB80600, 0xBA0700, 0xBC0700, 0xBD0700, 0xBF0700, 0xC10700, 0xC30800,
-        0xC40800, 0xC60800, 0xC80800, 0xCA0900, 0xCB0900, 0xCD0900, 0xCF0900, 0xD10A00, 0xD20A00,
-        0xD40A00, 0xD60B00, 0xD80B00, 0xD90C00, 0xDB0C00, 0xDD0C00, 0xDF0D00, 0xE00D00, 0xE20E00,
-        0xE40F00, 0xE60F00, 0xE71000, 0xE91100, 0xEB1200, 0xEC1300, 0xEE1500, 0xEF1800, 0xF01A00,
-        0xF11D00, 0xF22100, 0xF32400, 0xF42700, 0xF42A00, 0xF52E00, 0xF63100, 0xF63400, 0xF73700,
-        0xF73A00, 0xF73D00, 0xF83F00, 0xF84200, 0xF84500, 0xF94800, 0xF94A00, 0xF94D00, 0xF94F00,
-        0xFA5200, 0xFA5400, 0xFA5600, 0xFA5900, 0xFA5B00, 0xFB5D00, 0xFB6000, 0xFB6200, 0xFB6400,
-        0xFB6600, 0xFB6800, 0xFC6A00, 0xFC6C00, 0xFC6E00, 0xFC7000, 0xFC7200, 0xFC7400, 0xFC7600,
-        0xFC7800, 0xFC7A00, 0xFC7C00, 0xFD7E00, 0xFD8000, 0xFD8200, 0xFD8300, 0xFD8500, 0xFD8700,
-        0xFD8900, 0xFD8B00, 0xFD8C00, 0xFD8E00, 0xFD9000, 0xFD9200, 0xFD9300, 0xFE9500, 0xFE9700,
-        0xFE9900, 0xFE9A00, 0xFE9C00, 0xFE9E00, 0xFE9F00, 0xFEA100, 0xFEA300, 0xFEA400, 0xFEA600,
-        0xFEA800, 0xFEA900, 0xFEAB00, 0xFEAD00, 0xFEAE00, 0xFEB000, 0xFEB100, 0xFEB300, 0xFEB500,
-        0xFEB600, 0xFEB800, 0xFEB900, 0xFEBB00, 0xFEBD00, 0xFFBE00, 0xFFC000, 0xFFC100, 0xFFC300,
-        0xFFC400, 0xFFC600, 0xFFC700, 0xFFC900, 0xFFCB00, 0xFFCC00, 0xFFCE00, 0xFFCF00, 0xFFD100,
-        0xFFD200, 0xFFD400, 0xFFD500, 0xFFD700, 0xFFD800, 0xFFDA00, 0xFFDB00, 0xFFDD00, 0xFFDE00,
-        0xFFE000, 0xFFE100, 0xFFE300, 0xFFE400, 0xFFE600, 0xFFE700, 0xFFE900, 0xFFEA00, 0xFFEC00,
-        0xFFED00, 0xFFEF00, 0xFFF000, 0xFFF200, 0xFFF300, 0xFFF500, 0xFFF600, 0xFFF800, 0xFFF900,
-        0xFFFB00, 0xFFFC00, 0xFFFE00, 0xFFFF00,
-    ];
-
     const GAMMA8: [u8; 256] = [
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4,
@@ -576,7 +485,6 @@ mod app {
     #[allow(non_camel_case_types)]
     pub enum OperatingMode {
         DAY { mode: LightMode },
-        SUNRISE { ramp: LinearRamp },
         ALARM,
     }
 
@@ -763,7 +671,7 @@ mod app {
         buzz_pwm.set_duty(Channel::C1, 20 * (buzz_pwm.get_max_duty() / 100));
 
         let mut led_pin = gpioa.pa8.into_push_pull_output(&mut gpioa.crh);
-        led_pin.set_high();
+        led_pin.set_low();
 
         let mut pin = gpiob.pb0.into_floating_input(&mut gpiob.crl);
         pin.make_interrupt_source(&mut afio);
@@ -839,7 +747,7 @@ mod app {
     }
 
     #[task(shared = [temps],
-           local = [ds18b20_adrs, ow_delay, ow_bus, state: bool = false],
+           local = [ds18b20_adrs, ow_delay, ow_bus, led_pin, state: bool = false],
            priority = 16, capacity = 1)]
     fn ds18b20_task(cx: ds18b20_task::Context) {
         let addrs = cx.local.ds18b20_adrs;
@@ -849,18 +757,27 @@ mod app {
 
         if addrs.iter().any(|&a| a.is_some()) {
             if *cx.local.state {
+                let mut success = true;
+                cx.local.led_pin.set_high();
                 for (i, addr) in addrs.iter().flatten().enumerate() {
                     let sensor = Ds18b20::new::<core::fmt::Error>(*addr);
                     if let Ok(sensor) = sensor {
                         let data = sensor.read_data(bus, delay);
                         if let Ok(data) = data {
                             temps.lock(|temps| temps[i] = Some(data.temperature));
-                            defmt::error!("{} {}", sensor.address().0, data.temperature);
+                            defmt::info!("{} {}", sensor.address().0, data.temperature);
+                        } else {
+                            temps.lock(|temps| temps[i] = None);
+                            success = false;
                         }
                     }
                 }
                 *cx.local.state = false;
-                ds18b20_task::spawn_after(10000.millis()).unwrap();
+                cx.local.led_pin.set_low();
+                if !success {
+                    // retry
+                    ds18b20_task::spawn_after(2000.millis()).unwrap();
+                }
             } else if let Ok(()) = ds18b20::start_simultaneous_temp_measurement(bus, delay) {
                 *cx.local.state = true;
                 ds18b20_task::spawn_after(
@@ -923,7 +840,7 @@ mod app {
         }
     }
 
-    #[task(shared = [datetime], local = [cons, parser, led_pin], priority = 2, capacity = 1)]
+    #[task(shared = [datetime], local = [cons, parser], priority = 2, capacity = 1)]
     fn parse(cx: parse::Context) {
         let cons = cx.local.cons;
         let parser = cx.local.parser;
@@ -931,7 +848,8 @@ mod app {
         let parse::SharedResources { mut datetime } = cx.shared;
 
         if let Ok(rgr) = cons.read() {
-            defmt::trace!("{}", &rgr.buf());
+            // let s: String<160> = String::from_iter(rgr.buf().iter().map(|b| *b as char));
+            // defmt::trace!("{:?}", s.as_str());
 
             for result in parser.parse_from_bytes(&rgr) {
                 match result {
@@ -981,13 +899,6 @@ mod app {
                             LongitudeWrapper(gga.longitude.clone()),
                             LatitudeWrapper(gga.latitude.clone())
                         );
-                        if [nmea0183::GPSQuality::GPS, nmea0183::GPSQuality::DGPS]
-                            .contains(&gga.gps_quality)
-                        {
-                            cx.local.led_pin.set_low();
-                        } else {
-                            cx.local.led_pin.set_high();
-                        }
                         defmt::debug!(
                             "sats in use {}, quality {}",
                             gga.sat_in_use,
@@ -1923,10 +1834,13 @@ mod app {
                     buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
                 }
             }
+            if dt.time().second() == 0 {
+                ds18b20_task::spawn_after(150.millis()).unwrap();
+            }
         }
     }
 
-    fn disp_time(time: Time, mode: &mut OperatingMode, alarm_dur: &mut Duration) {
+    fn disp_time(time: Time, mode: &mut OperatingMode) {
         let (h, m, s) = time.as_hms();
         let mut buf: String<NUM_DIGITS> = String::new();
         buf.write_fmt(format_args!("{:02}{:02}{:02}", h, m, s))
@@ -1938,20 +1852,6 @@ mod app {
 
         let lmode = match mode {
             OperatingMode::DAY { mode } => mode.clone(),
-            OperatingMode::SUNRISE { ramp } => {
-                if let Some(y) = ramp.next() {
-                    let rgb =
-                        &SUNRISE_CMAP[TryInto::<usize>::try_into(y).unwrap()].to_be_bytes()[1..4];
-                    LightMode::SOLID_COLOR {
-                        color: RGB8::new(rgb[0], rgb[1], rgb[2]) / 4,
-                    }
-                } else {
-                    buzzer::spawn(BuzzerEvent::Alarm { i: Some(0) }).unwrap();
-                    *mode = OperatingMode::ALARM;
-                    *alarm_dur = Duration::ZERO;
-                    LightMode::GRADIENT
-                }
-            }
             _ => LightMode::GRADIENT,
         };
 
@@ -1976,15 +1876,11 @@ mod app {
                         *col = true;
                     }
                     let mut tmp: String<4> = String::new();
-                    tmp.write_fmt(format_args!("{:02.1}", *temp)).unwrap();
-                    let mut tmp: [char; 4] = str_to_array(&tmp);
-                    if tmp[0] == '0' {
-                        tmp[0] = ' ';
-                    }
-                    tmp[2] = tmp[3];
+                    tmp.write_fmt(format_args!("{: >4.1}", *temp)).unwrap();
+                    let tmp: [char; 4] = str_to_array(&tmp);
                     buf.push(tmp[0]).unwrap();
                     buf.push(tmp[1]).unwrap();
-                    buf.push(tmp[2]).unwrap();
+                    buf.push(tmp[3]).unwrap();
                 } else {
                     buf.push_str("---").unwrap();
                 }
@@ -2064,21 +1960,7 @@ mod app {
                         pps_tick_handler(dt, curr_mode, cx.local.alarm_dur);
                         *datetime = dt;
                         if let Some(dt) = *datetime {
-                            if *cx.local.alarm_enabled
-                                && ![Weekday::Saturday, Weekday::Sunday]
-                                    .contains(&dt.date().weekday())
-                                && dt.time() == (*alarm_time - SUNRISE_LEN)
-                            {
-                                defmt::info!("Starting sunrise");
-                                *curr_mode = OperatingMode::SUNRISE {
-                                    ramp: LinearRamp::new(
-                                        SUNRISE_LEN.whole_seconds().try_into().unwrap(),
-                                        SUNRISE_CMAP.len(),
-                                    ),
-                                };
-                            }
-
-                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                            disp_time(dt.time(), curr_mode);
                             *cx.local.handle =
                                 main_sm::spawn_after(500.millis(), MainEvent::Timeout).ok();
                         }
@@ -2097,7 +1979,7 @@ mod app {
                             if let Some(handle) = cx.local.handle.take() {
                                 handle.cancel().ok();
                             }
-                            disp_time(*alarm_time, curr_mode, cx.local.alarm_dur);
+                            disp_time(*alarm_time, curr_mode);
                             buzzer::spawn(BuzzerEvent::Alarm {
                                 i: Some(*cx.local.curr_al),
                             })
@@ -2121,7 +2003,7 @@ mod app {
                                 mode: DEFAULT_DAY_MODE,
                             };
                             if let Some(dt) = *datetime {
-                                disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                                disp_time(dt.time(), curr_mode);
                             }
                         }
                         Five => {
@@ -2129,7 +2011,7 @@ mod app {
                                 mode: LightMode::FIRE,
                             };
                             if let Some(dt) = *datetime {
-                                disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                                disp_time(dt.time(), curr_mode);
                             }
                         }
                         Seven => {
@@ -2137,7 +2019,7 @@ mod app {
                                 mode: LightMode::SUPER,
                             };
                             if let Some(dt) = *datetime {
-                                disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                                disp_time(dt.time(), curr_mode);
                             }
                         }
                         Six => {
@@ -2150,13 +2032,18 @@ mod app {
                                 },
                             };
                             if let Some(dt) = *datetime {
-                                disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                                disp_time(dt.time(), curr_mode);
                             }
                         }
                         Eight => {
                             *state = MainState::TempDisplay;
                             let ev = temps.lock(|temps| display_temp(temps));
                             light::spawn(ev).unwrap();
+                            if let Some(handle) = cx.local.handle.take() {
+                                handle.cancel().ok();
+                            }
+                            *cx.local.handle =
+                                main_sm::spawn_after(15000.millis(), MainEvent::Timeout).ok();
                         }
                         Nine => {
                             if let Some(dt) = *datetime {
@@ -2169,8 +2056,7 @@ mod app {
                         }
                     },
                 }
-                if (matches!(*curr_mode, OperatingMode::SUNRISE { .. })
-                    || matches!(*curr_mode, OperatingMode::ALARM))
+                if (matches!(*curr_mode, OperatingMode::ALARM))
                     && matches!(ev, MainEvent::Remote { .. })
                 {
                     *curr_mode = OperatingMode::DAY {
@@ -2193,7 +2079,7 @@ mod app {
                         buzzer::spawn(BuzzerEvent::Alarm { i: None }).unwrap();
                         *state = MainState::TimeDisplay;
                         if let Some(dt) = *datetime {
-                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                            disp_time(dt.time(), curr_mode);
                         }
                     }
                     Next => {
@@ -2219,11 +2105,11 @@ mod app {
                     }
                     ChannelListPrev => {
                         *alarm_time -= Duration::minutes(5);
-                        disp_time(*alarm_time, curr_mode, cx.local.alarm_dur);
+                        disp_time(*alarm_time, curr_mode);
                     }
                     ChannelListNext => {
                         *alarm_time += Duration::minutes(5);
-                        disp_time(*alarm_time, curr_mode, cx.local.alarm_dur);
+                        disp_time(*alarm_time, curr_mode);
                     }
                     _ => {
                         defmt::error!("Unh");
@@ -2232,20 +2118,30 @@ mod app {
                 _ => (),
             },
             MainState::TempDisplay => match ev {
-                MainEvent::PPSTick { dt: _ } => {
+                MainEvent::PPSTick { dt } => {
                     let ev = temps.lock(|temps| display_temp(temps));
                     light::spawn(ev).unwrap();
+                    pps_tick_handler(dt, curr_mode, cx.local.alarm_dur);
+                    *datetime = dt;
                 }
                 MainEvent::Remote { btn } => match btn {
-                    Eight => {
+                    One | Eight => {
                         *state = MainState::TimeDisplay;
                         if let Some(dt) = *datetime {
-                            disp_time(dt.time(), curr_mode, cx.local.alarm_dur);
+                            disp_time(dt.time(), curr_mode);
+                        }
+                        if let Some(handle) = cx.local.handle.take() {
+                            handle.cancel().ok();
                         }
                     }
                     _ => (),
                 },
-                _ => (),
+                MainEvent::Timeout => {
+                    *state = MainState::TimeDisplay;
+                    if let Some(dt) = *datetime {
+                        disp_time(dt.time(), curr_mode);
+                    }
+                }
             },
         }
     }
